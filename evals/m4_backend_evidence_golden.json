@@ -1,0 +1,109 @@
+{
+  "case_id": "backend-sql-deep-evidence-v1",
+  "description": "A concrete candidate answer supports API depth while SQL remains unassessed.",
+  "scorecard": {
+    "generator_version": "golden-v1",
+    "competencies": [
+      {
+        "id": "backend-api",
+        "name": "Backend and API engineering",
+        "description": "Designs reliable APIs and explains trade-offs.",
+        "weight": 60,
+        "classification": "must-have",
+        "seniority_expectation": "Works independently and explains operational trade-offs.",
+        "evidence_to_collect": ["A personally designed API and its failure handling"],
+        "question_families": ["API design"],
+        "source_references": [
+          {
+            "source_id": "jd:line:1",
+            "label": "Job description line 1",
+            "excerpt": "Design and operate reliable backend APIs."
+          }
+        ]
+      },
+      {
+        "id": "data-sql",
+        "name": "Data persistence and SQL",
+        "description": "Reasons about schemas, transactions, and query performance.",
+        "weight": 40,
+        "classification": "must-have",
+        "seniority_expectation": "Works independently on production data systems.",
+        "evidence_to_collect": ["A schema or query decision"],
+        "question_families": ["query performance"],
+        "source_references": [
+          {
+            "source_id": "jd:line:2",
+            "label": "Job description line 2",
+            "excerpt": "Tune PostgreSQL queries and schemas."
+          }
+        ]
+      }
+    ]
+  },
+  "turns": [
+    {
+      "id": "turn-1",
+      "sequence": 1,
+      "speaker": "assistant",
+      "transcript": "Tell me about an API you designed and how you handled failures."
+    },
+    {
+      "id": "turn-2",
+      "sequence": 2,
+      "speaker": "user",
+      "transcript": "I owned an idempotent payments endpoint. I stored an idempotency key with the transaction, returned the saved response on retries, and sent uncertain downstream work to a reconciliation queue."
+    },
+    {
+      "id": "turn-3",
+      "sequence": 3,
+      "speaker": "assistant",
+      "transcript": "What database performance example would you like to discuss?"
+    }
+  ],
+  "valid_draft": {
+    "competency_results": [
+      {
+        "competency_id": "backend-api",
+        "assessment": "scored",
+        "score": 4,
+        "rating_confidence": "high",
+        "evidence": [
+          {
+            "turn_id": "turn-2",
+            "quote": "I owned an idempotent payments endpoint."
+          }
+        ],
+        "evidence_summary": "The candidate personally owned retry-safe API behavior and described reconciliation.",
+        "gaps": ["Did not discuss authorization behavior."],
+        "recommendations": ["Practise explaining authorization failure cases."],
+        "not_assessed_reason": null
+      },
+      {
+        "competency_id": "data-sql",
+        "assessment": "not_assessed",
+        "score": null,
+        "rating_confidence": null,
+        "evidence": [],
+        "evidence_summary": null,
+        "gaps": [],
+        "recommendations": ["Complete a SQL query-plan practice interview."],
+        "not_assessed_reason": "The interviewer asked about SQL, but no candidate answer was captured."
+      }
+    ],
+    "strength_competency_ids": ["backend-api"],
+    "gap_competency_ids": [],
+    "practice_exercises": [
+      {
+        "title": "Failure-mode API walkthrough",
+        "competency_ids": ["backend-api"],
+        "instruction": "Explain one API through timeout, retry, and partial-failure scenarios.",
+        "success_criteria": ["Names ownership boundaries", "Explains retry safety"]
+      }
+    ]
+  },
+  "expected": {
+    "overall_score": 4.0,
+    "assessed_weight": 60,
+    "coverage_percentage": 60
+  }
+}

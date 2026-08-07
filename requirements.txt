@@ -1,5 +1,1 @@
-openai[realtime]
-sounddevice
-numpy
-opencv-python
-python-dotenv
+.
