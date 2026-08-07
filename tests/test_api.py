@@ -61,6 +61,32 @@ def test_settings_load_optional_local_env_after_base_env(
     )
 
 
+def test_settings_process_environment_overrides_dotenv_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_env = tmp_path / ".env"
+    local_env = tmp_path / ".env.local"
+    base_env.write_text(
+        "DATABASE_URL=postgresql+asyncpg://base:password@database/app\n"
+        "AUTO_CREATE_SCHEMA=false\n",
+        encoding="utf-8",
+    )
+    local_env.write_text(
+        "DATABASE_URL=sqlite+aiosqlite:///./data/interview_coach.db\n"
+        "AUTO_CREATE_SCHEMA=true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "DATABASE_URL", "postgresql+asyncpg://process:password@database/app"
+    )
+    monkeypatch.setenv("AUTO_CREATE_SCHEMA", "false")
+
+    settings = Settings(_env_file=(base_env, local_env))
+
+    assert settings.database_url == "postgresql+asyncpg://process:password@database/app"
+    assert settings.auto_create_schema is False
+
+
 def test_settings_reject_local_auth_and_sqlite_in_staging(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         Settings(
