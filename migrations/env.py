@@ -9,7 +9,11 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from api.config import get_settings
-from api.database import database_connect_args, normalized_database_url
+from api.database import (
+    database_connect_args,
+    install_database_network_compatibility,
+    normalized_database_url,
+)
 from api.models import Base
 
 config = context.config
@@ -46,6 +50,7 @@ def run_sync_migrations(connection: Connection) -> None:
 
 async def run_migrations_online() -> None:
     settings = get_settings()
+    install_database_network_compatibility(settings.database_url)
     connectable = async_engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import socket
 import sqlite3
 import ssl
 from datetime import UTC, datetime, timedelta
@@ -17,8 +18,12 @@ from pydantic import ValidationError
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
+import api.database as database
 from api.config import PROJECT_ROOT, Settings, get_settings
-from api.database import database_connect_args, normalized_database_url
+from api.database import (
+    database_connect_args,
+    normalized_database_url,
+)
 from api.main import create_app
 from api.services.realtime import RealtimeClientSecret
 from domain.evaluation import (
@@ -65,6 +70,34 @@ def test_neon_url_is_safe_for_asyncpg() -> None:
     assert ssl_context.check_hostname is True
     assert ssl_context.verify_mode == ssl.CERT_REQUIRED
     assert connect_args["timeout"] == 7.5
+
+
+@pytest.mark.asyncio
+async def test_neon_connection_prefers_ipv4_without_changing_tls_hostname() -> None:
+    calls: list[tuple[str | None, int | None, dict[str, object]]] = []
+
+    class FakeLoop:
+        async def create_connection(
+            self,
+            protocol_factory,
+            host: str | None = None,
+            port: int | None = None,
+            **kwargs: object,
+        ) -> str:
+            calls.append((host, port, kwargs))
+            return "connected"
+
+    hostname = "ep-example-pooler.us-east-2.aws.neon.tech"
+    loop = FakeLoop()
+    database.install_database_network_compatibility(
+        f"postgresql+asyncpg://candidate:secret@{hostname}/interview_coach",
+        loop=loop,
+    )
+
+    result = await loop.create_connection(object, hostname, 5432, ssl="verified")
+
+    assert result == "connected"
+    assert calls == [(hostname, 5432, {"ssl": "verified", "family": socket.AF_INET})]
 
 
 @pytest.fixture

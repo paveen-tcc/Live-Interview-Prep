@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import socket
 import ssl
 from collections.abc import AsyncIterator
+from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import certifi
@@ -17,6 +20,8 @@ from sqlalchemy.ext.asyncio import (
 
 from .config import Settings
 from .models import Base
+
+_NEON_IPV4_ADAPTER_HOSTS = "_interview_coach_neon_ipv4_hosts"
 
 
 def normalized_database_url(database_url: str) -> str:
@@ -52,6 +57,39 @@ def database_connect_args(
             "timeout": timeout_seconds,
         }
     return {}
+
+
+def install_database_network_compatibility(
+    database_url: str, *, loop: Any | None = None
+) -> None:
+    """Prefer IPv4 for Neon while preserving its hostname for verified TLS."""
+    hostname = urlsplit(normalized_database_url(database_url)).hostname
+    if not hostname or not hostname.endswith(".neon.tech"):
+        return
+
+    active_loop = loop or asyncio.get_running_loop()
+    adapted_hosts = set(getattr(active_loop, _NEON_IPV4_ADAPTER_HOSTS, set()))
+    if hostname in adapted_hosts:
+        return
+
+    original_create_connection = active_loop.create_connection
+
+    async def create_connection(
+        protocol_factory,
+        host: str | None = None,
+        port: int | None = None,
+        **kwargs: object,
+    ):
+        if host == hostname and kwargs.get("family", socket.AF_UNSPEC) in {
+            socket.AF_UNSPEC,
+            0,
+        }:
+            kwargs["family"] = socket.AF_INET
+        return await original_create_connection(protocol_factory, host, port, **kwargs)
+
+    active_loop.create_connection = create_connection
+    adapted_hosts.add(hostname)
+    setattr(active_loop, _NEON_IPV4_ADAPTER_HOSTS, adapted_hosts)
 
 
 def create_database(

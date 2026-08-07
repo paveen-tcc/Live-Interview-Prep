@@ -13,7 +13,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import Settings, get_settings
-from .database import create_database, create_schema
+from .database import (
+    create_database,
+    create_schema,
+    install_database_network_compatibility,
+)
 from .errors import install_error_handlers
 from .logging_config import configure_logging
 from .routes import (
@@ -37,6 +41,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
+        install_database_network_compatibility(resolved_settings.database_url)
         engine, session_factory = create_database(resolved_settings)
         application.state.engine = engine
         application.state.session_factory = session_factory
