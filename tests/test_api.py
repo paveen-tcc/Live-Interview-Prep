@@ -33,6 +33,34 @@ from domain.evaluation import (
 )
 
 
+def test_settings_load_optional_local_env_after_base_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base_env = tmp_path / ".env"
+    local_env = tmp_path / ".env.local"
+    base_env.write_text(
+        "DATABASE_URL=postgresql+asyncpg://user:password@database/app\n"
+        "AUTO_CREATE_SCHEMA=false\n",
+        encoding="utf-8",
+    )
+    local_env.write_text(
+        "DATABASE_URL=sqlite+aiosqlite:///./data/interview_coach.db\n"
+        "AUTO_CREATE_SCHEMA=true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("AUTO_CREATE_SCHEMA", raising=False)
+
+    settings = Settings(_env_file=(base_env, local_env))
+
+    assert settings.database_url == "sqlite+aiosqlite:///./data/interview_coach.db"
+    assert settings.auto_create_schema is True
+    assert Settings.model_config["env_file"] == (
+        PROJECT_ROOT / ".env",
+        PROJECT_ROOT / ".env.local",
+    )
+
+
 def test_settings_reject_local_auth_and_sqlite_in_staging(tmp_path: Path) -> None:
     with pytest.raises(ValidationError):
         Settings(
