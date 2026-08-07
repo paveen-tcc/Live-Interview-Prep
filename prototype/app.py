@@ -1,7 +1,8 @@
-"""Local camera preview with a half-duplex OpenAI Realtime voice conversation."""
+"""Local voice or typed-input conversation using Azure OpenAI Realtime."""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import base64
 from dataclasses import dataclass
@@ -9,13 +10,18 @@ import os
 import queue
 import threading
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
 
 import cv2
 import sounddevice as sd
 from dotenv import load_dotenv
 from openai import AsyncAzureOpenAI
 
+try:
+    from .prototype_config import ConfigurationError, load_azure_realtime_settings
+except ImportError:  # Support direct execution: python prototype/app.py
+    from prototype_config import ConfigurationError, load_azure_realtime_settings
+
+load_dotenv()
 
 SAMPLE_RATE = 24_000
 CHANNELS = 1
@@ -23,6 +29,11 @@ DTYPE = "int16"
 BLOCK_DURATION_MS = 20
 BLOCK_SIZE = SAMPLE_RATE * BLOCK_DURATION_MS // 1_000
 WINDOW_NAME = "AI Voice Conversation MVP"
+PLAYBACK_PREFILL_MS = 100
+BYTES_PER_SAMPLE = 2
+PLAYBACK_PREFILL_BYTES = (
+    SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE * PLAYBACK_PREFILL_MS // 1_000
+)
 
 
 class AppError(RuntimeError):
@@ -38,16 +49,20 @@ class RuntimeState:
 
 
 class AudioPlayer:
-    """Play streamed PCM16 chunks without blocking the Realtime event loop."""
+    """Play streamed PCM16 with a small startup jitter buffer."""
 
-    _SENTINEL = None
+    _END_RESPONSE = object()
+    _SENTINEL = object()
 
     def __init__(self) -> None:
-        self._queue: queue.Queue[bytes | None] = queue.Queue()
+        self._queue: queue.Queue[bytes | object] = queue.Queue()
         self._stop_event = threading.Event()
         self._ready_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._startup_error: BaseException | None = None
+        self._diagnostics_printed = False
+        self.underflow_count = 0
+        self.completed_response_count = 0
         self.runtime_error: BaseException | None = None
 
     def start(self) -> None:
@@ -70,32 +85,97 @@ class AudioPlayer:
         if audio and not self._stop_event.is_set():
             self._queue.put_nowait(audio)
 
+    def finish_response(self) -> None:
+        """Flush a response tail and re-arm prefill for the next response."""
+        if not self._stop_event.is_set():
+            self._queue.put_nowait(self._END_RESPONSE)
+
     def stop(self) -> None:
         self._stop_event.set()
         self._queue.put_nowait(self._SENTINEL)
         if self._thread is not None and self._thread.is_alive():
             self._thread.join(timeout=3)
+        if not self._diagnostics_printed:
+            print(
+                "Playback diagnostics: "
+                f"{self.underflow_count} underflow(s) across "
+                f"{self.completed_response_count} completed response(s); "
+                f"startup prefill {PLAYBACK_PREFILL_MS} ms."
+            )
+            self._diagnostics_printed = True
+
+    def _write_audio(self, stream: sd.RawOutputStream, audio: bytes) -> None:
+        if not audio:
+            return
+        if stream.write(audio):
+            self.underflow_count += 1
+            print(
+                "Playback underflow "
+                f"#{self.underflow_count}: PortAudio exhausted buffered audio. "
+                "Check network jitter and output-device load."
+            )
 
     def _playback_worker(self) -> None:
+        playback_buffer = bytearray()
+        prefilling = True
+        block_bytes = BLOCK_SIZE * CHANNELS * BYTES_PER_SAMPLE
+        stream: sd.RawOutputStream | None = None
+        stream_started = False
         try:
-            with sd.RawOutputStream(
+            stream = sd.RawOutputStream(
                 samplerate=SAMPLE_RATE,
                 channels=CHANNELS,
                 dtype=DTYPE,
                 blocksize=BLOCK_SIZE,
-            ) as stream:
-                self._ready_event.set()
-                while not self._stop_event.is_set():
-                    chunk = self._queue.get()
-                    if chunk is self._SENTINEL or self._stop_event.is_set():
-                        break
-                    stream.write(chunk)
+            )
+            self._ready_event.set()
+            while not self._stop_event.is_set():
+                item = self._queue.get()
+                if item is self._SENTINEL or self._stop_event.is_set():
+                    break
+                if item is self._END_RESPONSE:
+                    if playback_buffer:
+                        if not stream_started:
+                            stream.start()
+                            stream_started = True
+                        self._write_audio(stream, bytes(playback_buffer))
+                        playback_buffer.clear()
+                    if stream_started:
+                        stream.stop()
+                        stream_started = False
+                    self.completed_response_count += 1
+                    prefilling = True
+                    continue
+
+                if not isinstance(item, bytes):
+                    continue
+                playback_buffer.extend(item)
+                if prefilling and len(playback_buffer) < PLAYBACK_PREFILL_BYTES:
+                    continue
+                if not stream_started:
+                    stream.start()
+                    stream_started = True
+                prefilling = False
+                while len(playback_buffer) >= block_bytes:
+                    block = bytes(playback_buffer[:block_bytes])
+                    del playback_buffer[:block_bytes]
+                    self._write_audio(stream, block)
         except BaseException as exc:
             if not self._ready_event.is_set():
                 self._startup_error = exc
             else:
                 self.runtime_error = exc
         finally:
+            if stream is not None:
+                if stream_started:
+                    try:
+                        stream.stop()
+                    except Exception:
+                        pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
             self._ready_event.set()
 
 
@@ -188,30 +268,6 @@ def _format_openai_exception(exc: BaseException) -> str:
     return f"OpenAI Realtime connection failed ({error_name})."
 
 
-def _normalize_azure_endpoint(endpoint: str) -> str:
-    """Return the resource root expected by AsyncAzureOpenAI.
-
-    Azure's generated v1 examples sometimes show a base URL ending in
-    /openai/v1. AsyncAzureOpenAI builds that service path itself, so retaining it
-    would produce /openai/v1/openai/realtime and a misleading deployment 404.
-    """
-    value = endpoint.strip().rstrip("/")
-    parsed = urlsplit(value)
-    if parsed.scheme != "https" or not parsed.netloc:
-        raise AppError(
-            "AZURE_OPENAI_ENDPOINT must be a complete HTTPS URL from Azure Foundry."
-        )
-    path = parsed.path.rstrip("/")
-    if path.lower().endswith("/openai/v1"):
-        path = path[: -len("/openai/v1")]
-    elif path:
-        raise AppError(
-            "AZURE_OPENAI_ENDPOINT must contain only the Azure resource host; "
-            "remove extra URL paths."
-        )
-    return urlunsplit((parsed.scheme, parsed.netloc, path, "", "")).rstrip("/")
-
-
 def _print_audio_devices() -> None:
     print("Available audio devices:")
     try:
@@ -232,6 +288,10 @@ def _validate_audio_settings() -> None:
             "24 kHz mono PCM16. Check the input device and OS permissions."
         ) from exc
 
+    _validate_output_audio_settings()
+
+
+def _validate_output_audio_settings() -> None:
     try:
         sd.check_output_settings(
             samplerate=SAMPLE_RATE, channels=CHANNELS, dtype=DTYPE
@@ -282,7 +342,12 @@ async def receive_realtime_events(
     audio_player: AudioPlayer,
     state: RuntimeState,
     stop_event: asyncio.Event,
+    *,
+    text_input_mode: bool = False,
+    response_complete_event: asyncio.Event | None = None,
 ) -> None:
+    response_has_audio = False
+    response_audio_finished = False
     try:
         async for event in connection:
             event_type = _event_value(event, "type", "")
@@ -290,29 +355,39 @@ async def receive_realtime_events(
             if event_type == "session.created":
                 state.status = "CONNECTING"
             elif event_type == "session.updated":
-                state.status = "LISTENING"
+                state.status = "READY FOR TEXT" if text_input_mode else "LISTENING"
             elif event_type == "input_audio_buffer.speech_started":
                 state.status = "YOU ARE SPEAKING"
             elif event_type == "input_audio_buffer.speech_stopped":
                 state.status = "AI IS THINKING"
             elif event_type == "response.created":
                 state.status = "AI IS THINKING"
+                response_has_audio = False
+                response_audio_finished = False
             elif event_type in {
                 "response.audio.delta",
                 "response.output_audio.delta",
             }:
                 delta = _event_value(event, "delta")
                 if delta:
+                    response_has_audio = True
                     state.ai_speaking = True
                     state.status = "AI IS SPEAKING"
                     audio_player.enqueue(base64.b64decode(delta, validate=True))
-            elif event_type in {
-                "response.audio.done",
-                "response.output_audio.done",
-                "response.done",
-            }:
+            elif event_type in {"response.audio.done", "response.output_audio.done"}:
+                if response_has_audio and not response_audio_finished:
+                    audio_player.finish_response()
+                    response_audio_finished = True
                 state.ai_speaking = False
-                state.status = "LISTENING"
+                state.status = "READY FOR TEXT" if text_input_mode else "LISTENING"
+            elif event_type == "response.done":
+                if response_has_audio and not response_audio_finished:
+                    audio_player.finish_response()
+                    response_audio_finished = True
+                state.ai_speaking = False
+                state.status = "READY FOR TEXT" if text_input_mode else "LISTENING"
+                if response_complete_event is not None:
+                    response_complete_event.set()
             elif event_type == "error":
                 message = _event_error_message(event)
                 state.ai_speaking = False
@@ -330,6 +405,79 @@ async def receive_realtime_events(
         raise
     except Exception as exc:
         raise AppError(_format_openai_exception(exc)) from exc
+
+
+def _complete_console_read(
+    future: asyncio.Future[str | None], value: str | None
+) -> None:
+    if not future.done():
+        future.set_result(value)
+
+
+async def _read_console_line(prompt: str) -> str | None:
+    """Read one line without blocking the Realtime event loop."""
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future[str | None] = loop.create_future()
+
+    def read_worker() -> None:
+        try:
+            value: str | None = input(prompt)
+        except EOFError:
+            value = None
+        try:
+            loop.call_soon_threadsafe(_complete_console_read, future, value)
+        except RuntimeError:
+            pass
+
+    threading.Thread(
+        target=read_worker,
+        name="console-text-input",
+        daemon=True,
+    ).start()
+    return await future
+
+
+async def text_prompt_sender(
+    connection: Any,
+    state: RuntimeState,
+    stop_event: asyncio.Event,
+    response_complete_event: asyncio.Event,
+) -> None:
+    print("Text input mode: camera and microphone are off.")
+    print("Type a message and press Enter. Type /quit to end the session.")
+
+    while not stop_event.is_set():
+        state.status = "READY FOR TEXT"
+        prompt = await _read_console_line("You: ")
+        if prompt is None or prompt.strip().lower() in {"/quit", "/exit"}:
+            stop_event.set()
+            return
+        prompt = prompt.strip()
+        if not prompt:
+            continue
+
+        response_complete_event.clear()
+        state.status = "AI IS THINKING"
+        await connection.conversation.item.create(
+            item={
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": prompt}],
+            }
+        )
+        await connection.response.create()
+
+        response_waiter = asyncio.create_task(response_complete_event.wait())
+        stop_waiter = asyncio.create_task(stop_event.wait())
+        done, pending = await asyncio.wait(
+            {response_waiter, stop_waiter},
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if stop_waiter in done:
+            return
 
 
 async def camera_preview_loop(
@@ -440,37 +588,18 @@ async def _cancel_tasks(tasks: list[asyncio.Task[Any]]) -> None:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def run_app() -> None:
+async def run_app(*, text_input: bool = False) -> None:
     load_dotenv()
-    azure_settings = {
-        "AZURE_OPENAI_API_KEY": os.getenv("AZURE_OPENAI_API_KEY", "").strip(),
-        "AZURE_OPENAI_ENDPOINT": os.getenv("AZURE_OPENAI_ENDPOINT", "").strip(),
-        "AZURE_OPENAI_API_VERSION": os.getenv(
-            "AZURE_OPENAI_API_VERSION", ""
-        ).strip(),
-        "AZURE_OPENAI_REALTIME_DEPLOYMENT": os.getenv(
-            "AZURE_OPENAI_REALTIME_DEPLOYMENT", ""
-        ).strip(),
-    }
-    missing_settings = [name for name, value in azure_settings.items() if not value]
-    if missing_settings:
-        raise AppError(
-            "Missing Azure configuration: "
-            + ", ".join(missing_settings)
-            + ". Copy .env.example to .env and fill every Azure value."
-        )
-
-    api_key = azure_settings["AZURE_OPENAI_API_KEY"]
-    azure_endpoint = _normalize_azure_endpoint(
-        azure_settings["AZURE_OPENAI_ENDPOINT"]
-    )
-    api_version = azure_settings["AZURE_OPENAI_API_VERSION"]
-    realtime_deployment = azure_settings["AZURE_OPENAI_REALTIME_DEPLOYMENT"]
-    realtime_voice = os.getenv("AZURE_OPENAI_REALTIME_VOICE", "marin").strip()
     try:
-        camera_index = int(os.getenv("CAMERA_INDEX", "0"))
-    except ValueError as exc:
-        raise AppError("CAMERA_INDEX must be an integer, such as 0.") from exc
+        azure_settings = load_azure_realtime_settings()
+    except ConfigurationError as exc:
+        raise AppError(str(exc)) from exc
+    camera_index = 0
+    if not text_input:
+        try:
+            camera_index = int(os.getenv("CAMERA_INDEX", "0"))
+        except ValueError as exc:
+            raise AppError("CAMERA_INDEX must be an integer, such as 0.") from exc
 
     state = RuntimeState()
     stop_event = asyncio.Event()
@@ -481,52 +610,57 @@ async def run_app() -> None:
     tasks: list[asyncio.Task[Any]] = []
 
     try:
-        camera = cv2.VideoCapture(camera_index)
-        if not camera.isOpened():
-            raise AppError(
-                f"Could not open camera index {camera_index}. Check camera permissions "
-                "and close other camera applications."
-            )
-        tasks.append(
-            asyncio.create_task(
-                camera_preview_loop(camera, state, stop_event), name="camera-preview"
-            )
-        )
-
-        _validate_audio_settings()
-        loop = asyncio.get_running_loop()
-
-        def microphone_callback(
-            indata: memoryview,
-            frames: int,
-            time_info: Any,
-            status: sd.CallbackFlags,
-        ) -> None:
-            del frames, time_info
-            if status:
-                print(f"Microphone warning: {status}")
-            loop.call_soon_threadsafe(
-                _put_microphone_chunk,
-                microphone_queue,
-                bytes(indata),
-                state,
+        if not text_input:
+            camera = cv2.VideoCapture(camera_index)
+            if not camera.isOpened():
+                raise AppError(
+                    f"Could not open camera index {camera_index}. Check camera permissions "
+                    "and close other camera applications."
+                )
+            tasks.append(
+                asyncio.create_task(
+                    camera_preview_loop(camera, state, stop_event),
+                    name="camera-preview",
+                )
             )
 
-        try:
-            microphone_stream = sd.RawInputStream(
-                samplerate=SAMPLE_RATE,
-                channels=CHANNELS,
-                dtype=DTYPE,
-                blocksize=BLOCK_SIZE,
-                callback=microphone_callback,
-            )
-            microphone_stream.start()
-        except (sd.PortAudioError, ValueError) as exc:
-            _print_audio_devices()
-            raise AppError(
-                "The default microphone could not be opened. Check that another "
-                "application is not using it and that microphone access is allowed."
-            ) from exc
+        if text_input:
+            _validate_output_audio_settings()
+        else:
+            _validate_audio_settings()
+            loop = asyncio.get_running_loop()
+
+            def microphone_callback(
+                indata: memoryview,
+                frames: int,
+                time_info: Any,
+                status: sd.CallbackFlags,
+            ) -> None:
+                del frames, time_info
+                if status:
+                    print(f"Microphone warning: {status}")
+                loop.call_soon_threadsafe(
+                    _put_microphone_chunk,
+                    microphone_queue,
+                    bytes(indata),
+                    state,
+                )
+
+            try:
+                microphone_stream = sd.RawInputStream(
+                    samplerate=SAMPLE_RATE,
+                    channels=CHANNELS,
+                    dtype=DTYPE,
+                    blocksize=BLOCK_SIZE,
+                    callback=microphone_callback,
+                )
+                microphone_stream.start()
+            except (sd.PortAudioError, ValueError) as exc:
+                _print_audio_devices()
+                raise AppError(
+                    "The default microphone could not be opened. Check that another "
+                    "application is not using it and that microphone access is allowed."
+                ) from exc
 
         audio_player = AudioPlayer()
         try:
@@ -536,53 +670,81 @@ async def run_app() -> None:
             raise
 
         async with AsyncAzureOpenAI(
-            api_key=api_key,
-            azure_endpoint=azure_endpoint,
-            api_version=api_version,
-            azure_deployment=realtime_deployment,
+            api_key=azure_settings.api_key,
+            azure_endpoint=azure_settings.endpoint,
+            api_version=azure_settings.api_version,
+            azure_deployment=azure_settings.deployment,
         ) as client:
             try:
                 async with client.realtime.connect(
-                    model=realtime_deployment
+                    model=azure_settings.deployment
                 ) as connection:
                     if stop_event.is_set():
                         return
-                    await connection.session.update(
-                        session={
-                            # Azure's 2025-04-01-preview Realtime API uses the
-                            # original, flat session schema. The model/deployment
-                            # is already selected in the WebSocket URL.
-                            "modalities": ["text", "audio"],
-                            "instructions": (
-                                "You are a friendly conversational AI. "
-                                "Wait for the user to speak first. "
-                                "Respond naturally using one or two short spoken sentences. "
-                                "Do not conduct an interview and do not evaluate the user."
-                            ),
-                            "voice": realtime_voice,
-                            "input_audio_format": "pcm16",
-                            "output_audio_format": "pcm16",
-                            "turn_detection": {
-                                "type": "server_vad",
-                                "create_response": True,
-                                "interrupt_response": False,
-                            },
-                        }
-                    )
-
-                    microphone_task = asyncio.create_task(
-                        microphone_sender(
-                            connection, microphone_queue, state, stop_event
+                    session_config: dict[str, Any] = {
+                        # Azure's 2025-04-01-preview Realtime API uses the
+                        # original, flat session schema. The model/deployment is
+                        # already selected in the WebSocket URL.
+                        "modalities": ["text", "audio"],
+                        "instructions": (
+                            "You are a friendly conversational AI. "
+                            "Wait for the user to provide a message first. "
+                            "Respond naturally using one or two short spoken sentences. "
+                            "Do not conduct an interview and do not evaluate the user."
                         ),
-                        name="microphone-sender",
-                    )
+                        "voice": azure_settings.voice,
+                        "output_audio_format": "pcm16",
+                    }
+                    if not text_input:
+                        session_config.update(
+                            {
+                                "input_audio_format": "pcm16",
+                                "turn_detection": {
+                                    "type": "server_vad",
+                                    "create_response": True,
+                                    "interrupt_response": False,
+                                },
+                            }
+                        )
+                    await connection.session.update(session=session_config)
+
+                    response_complete_event = asyncio.Event()
                     receiver_task = asyncio.create_task(
                         receive_realtime_events(
-                            connection, audio_player, state, stop_event
+                            connection,
+                            audio_player,
+                            state,
+                            stop_event,
+                            text_input_mode=text_input,
+                            response_complete_event=response_complete_event,
                         ),
                         name="realtime-receiver",
                     )
-                    tasks.extend([microphone_task, receiver_task])
+                    tasks.append(receiver_task)
+                    if text_input:
+                        tasks.append(
+                            asyncio.create_task(
+                                text_prompt_sender(
+                                    connection,
+                                    state,
+                                    stop_event,
+                                    response_complete_event,
+                                ),
+                                name="text-prompt-sender",
+                            )
+                        )
+                    else:
+                        tasks.append(
+                            asyncio.create_task(
+                                microphone_sender(
+                                    connection,
+                                    microphone_queue,
+                                    state,
+                                    stop_event,
+                                ),
+                                name="microphone-sender",
+                            )
+                        )
                     monitor_task = asyncio.create_task(
                         monitor_runtime_tasks(
                             list(tasks), audio_player, state, stop_event
@@ -629,14 +791,36 @@ async def run_app() -> None:
         if audio_player is not None:
             audio_player.stop()
         if camera is not None:
-            camera.release()
-        cv2.destroyAllWindows()
+            try:
+                camera.release()
+            except Exception:
+                pass
+        try:
+            cv2.destroyAllWindows()
+        except cv2.error:
+            pass
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Talk to Azure OpenAI Realtime using voice or typed prompts."
+    )
+    parser.add_argument(
+        "--text-input",
+        action="store_true",
+        help="type prompts and hear audio replies without opening camera or microphone",
+    )
+    return parser.parse_args()
 
 
 def main() -> int:
+    args = _parse_args()
     try:
-        asyncio.run(run_app())
-        print("Session ended. Camera and audio devices were released.")
+        asyncio.run(run_app(text_input=args.text_input))
+        if args.text_input:
+            print("Session ended. The audio output device was released.")
+        else:
+            print("Session ended. Camera and audio devices were released.")
         return 0
     except KeyboardInterrupt:
         print("\nSession ended by Ctrl+C. Devices were released.")
