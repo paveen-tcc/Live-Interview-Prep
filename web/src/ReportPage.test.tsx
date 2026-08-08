@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -187,5 +187,54 @@ describe("evidence report", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Transcript final")).toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("evaluation kickoff", () => {
+  it("requests evaluation once even while the poller republishes the interview", async () => {
+    const finalizing: InterviewSession = {
+      ...readyInterview,
+      status: "TRANSCRIPT_FINALIZING",
+    };
+    const evaluateCalls: string[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      async (input: RequestInfo | URL) => {
+        const url = String(input);
+        if (url.endsWith("/evaluate")) {
+          evaluateCalls.push(url);
+          return new Response(
+            JSON.stringify({
+              interview_id: finalizing.id,
+              status: "EVALUATING",
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify(finalizing), { status: 200 });
+      },
+    );
+
+    // A new object identity each render is exactly what the 2-second poller
+    // produced; it previously re-fired /evaluate on every tick and raced the
+    // background job into a unique-constraint violation.
+    const view = render(
+      <ReportPage
+        interview={{ ...finalizing }}
+        onBack={vi.fn()}
+        onInterviewUpdated={vi.fn()}
+      />,
+    );
+    for (let tick = 0; tick < 4; tick += 1) {
+      view.rerender(
+        <ReportPage
+          interview={{ ...finalizing }}
+          onBack={vi.fn()}
+          onInterviewUpdated={vi.fn()}
+        />,
+      );
+    }
+
+    await waitFor(() => expect(evaluateCalls.length).toBeGreaterThan(0));
+    expect(evaluateCalls).toHaveLength(1);
   });
 });

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { api, ApiError } from "./api";
 import { ArrowLeftIcon, CheckIcon, ClockIcon, FileIcon } from "./icons";
@@ -65,6 +65,9 @@ export function ReportPage({
   const [retrying, setRetrying] = useState(false);
   const [deletingDelivery, setDeletingDelivery] = useState(false);
   const [disablingDelivery, setDisablingDelivery] = useState(false);
+  const evaluationRequestedRef = useRef<string | null>(null);
+  const onInterviewUpdatedRef = useRef(onInterviewUpdated);
+  onInterviewUpdatedRef.current = onInterviewUpdated;
 
   const loadReport = useCallback(async () => {
     setLoading(true);
@@ -86,16 +89,24 @@ export function ReportPage({
     if (interview.status === "REPORT_READY") void loadReport();
   }, [interview.status, loadReport, reloadKey]);
 
+  // Keyed on id + status, not the whole interview: the 2-second poller below
+  // republishes a new interview object on every tick, and depending on the
+  // object (or on an unmemoized callback) re-ran this effect — and so re-posted
+  // /evaluate — roughly every two seconds until the status changed.
   useEffect(() => {
     if (interview.status !== "TRANSCRIPT_FINALIZING") return;
+    if (evaluationRequestedRef.current === interview.id) return;
+    evaluationRequestedRef.current = interview.id;
     let active = true;
     api
       .evaluate(interview.id)
       .then(() => {
-        if (active) onInterviewUpdated({ ...interview, status: "EVALUATING" });
+        if (active)
+          onInterviewUpdatedRef.current({ ...interview, status: "EVALUATING" });
       })
       .catch((caught: unknown) => {
         if (!active) return;
+        evaluationRequestedRef.current = null;
         setError(
           caught instanceof ApiError
             ? caught
@@ -105,7 +116,8 @@ export function ReportPage({
     return () => {
       active = false;
     };
-  }, [interview, onInterviewUpdated]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [interview.id, interview.status]);
 
   useEffect(() => {
     if (!PROCESSING_STATES.has(interview.status)) return;
@@ -142,6 +154,7 @@ export function ReportPage({
   async function retryEvaluation() {
     setRetrying(true);
     setError(null);
+    evaluationRequestedRef.current = interview.id;
     try {
       await api.evaluate(interview.id);
       onInterviewUpdated({ ...interview, status: "EVALUATING" });

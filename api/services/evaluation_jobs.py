@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from domain.evaluation import EvaluationReport, EvaluationTranscriptTurn
 from domain.intake import ScorecardDocument, Seniority
@@ -22,6 +23,29 @@ from .evaluation import EvaluationServiceError, evaluate_transcript
 logger = logging.getLogger(__name__)
 
 EVALUATION_SCHEMA_VERSION = "evidence-report-v1"
+
+
+async def _commit_unless_claimed(database: Any, interview_id: str) -> bool:
+    """Commit this job's claim, yielding to whichever job inserted first.
+
+    The selects above take ``FOR UPDATE``, which serializes concurrent jobs on
+    PostgreSQL but is silently ignored by SQLite. There the guard cannot hold,
+    so two duplicate requests both observe "no evaluation yet", both insert, and
+    the second violates the unique constraint on ``evaluations.session_id``.
+    Treat that violation as the intended outcome — one evaluation exists and
+    another job owns it — rather than as an unhandled failure.
+    """
+
+    try:
+        await database.commit()
+        return True
+    except IntegrityError:
+        await database.rollback()
+        logger.info(
+            "evaluation_already_claimed",
+            extra={"interview_id": interview_id},
+        )
+        return False
 
 
 def transcript_fingerprint(turns: list[InterviewTurn]) -> str:
@@ -101,7 +125,8 @@ async def run_evaluation_job(
                 database.add(evaluation)
             _mark_failed(evaluation, _failure_code(exc))
             interview.status = "FAILED_RECOVERABLE"
-            await database.commit()
+            if not await _commit_unless_claimed(database, interview_id):
+                return
             return
 
         now = datetime.now(UTC)
@@ -123,7 +148,8 @@ async def run_evaluation_job(
         evaluation.started_at = now
         evaluation.failure_code = None
         interview.status = "EVALUATING"
-        await database.commit()
+        if not await _commit_unless_claimed(database, interview_id):
+            return
 
     assert report_input is not None
     try:

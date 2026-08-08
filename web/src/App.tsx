@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { api, ApiError } from "./api";
 import { ConfirmationDialog } from "./ConfirmationDialog";
@@ -113,14 +113,16 @@ export function App() {
     }
   }
 
-  function updateInterview(updated: InterviewSession) {
+  // Stable identity: child effects depend on this callback, and a new function
+  // every render re-ran them on every poll tick.
+  const updateInterview = useCallback((updated: InterviewSession) => {
     setInterviews((current) =>
       current.map((interview) =>
         interview.id === updated.id ? updated : interview,
       ),
     );
     setSelectedInterview(updated);
-  }
+  }, []);
 
   async function deleteSession() {
     if (!pendingDelete) return;

@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import uuid
 from copy import deepcopy
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from api.config import Settings
 from api.services.evaluation import EvaluationServiceError, evaluate_transcript
@@ -238,3 +241,96 @@ async def test_service_rejects_unordered_transcript_before_model_call() -> None:
 
     assert caught.value.status_code == 409
     assert not fake_responses.calls
+
+
+@pytest.mark.asyncio
+async def test_duplicate_evaluation_jobs_yield_instead_of_crashing(
+    tmp_path: Path,
+) -> None:
+    """Two jobs racing for one session must not raise an unhandled IntegrityError.
+
+    ``run_evaluation_job`` guards with ``SELECT ... FOR UPDATE``, which SQLite
+    ignores, so duplicate /evaluate requests both observed "no evaluation yet"
+    and both inserted. The second violated the unique constraint on
+    ``evaluations.session_id`` and crashed the background task.
+    """
+
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from api.models import Base, Evaluation, InterviewSession, User
+    from api.services.evaluation_jobs import _commit_unless_claimed
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'race.db'}")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    now = datetime.now(UTC)
+    async with factory() as setup:
+        setup.add(
+            User(
+                id="user-1",
+                auth_subject="subject-1",
+                email="developer@local.test",
+                display_name="Local developer",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        setup.add(
+            InterviewSession(
+                id="session-1",
+                user_id="user-1",
+                title="Race",
+                status="TRANSCRIPT_FINALIZING",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await setup.commit()
+
+    def _evaluation() -> Evaluation:
+        return Evaluation(
+            id=str(uuid.uuid4()),
+            session_id="session-1",
+            status="EVALUATING",
+            schema_version="evidence-report-v1",
+            evaluator_version="v1",
+            prompt_version="v1",
+            model_deployment="gpt-5.6-luna",
+            setup_fingerprint="a" * 64,
+            transcript_fingerprint="b" * 64,
+            transcript_turn_count=2,
+            transcript_finalized_at=now,
+            scorecard_snapshot={},
+            attempt_count=0,
+            competency_results=[],
+            overall_result=None,
+            strengths=[],
+            gaps=[],
+            practice_exercises=[],
+            uncertainty=[],
+            created_at=now,
+            updated_at=now,
+        )
+
+    async with factory() as first, factory() as second:
+        first.add(_evaluation())
+        second.add(_evaluation())
+        assert await _commit_unless_claimed(first, "session-1") is True
+        # The loser must report the loss rather than propagate the violation.
+        assert await _commit_unless_claimed(second, "session-1") is False
+
+    async with factory() as check:
+        rows = (
+            (
+                await check.execute(
+                    select(Evaluation).where(Evaluation.session_id == "session-1")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(rows) == 1
+
+    await engine.dispose()
