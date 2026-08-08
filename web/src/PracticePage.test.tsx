@@ -219,6 +219,7 @@ function mockInitialRequests(nextRuntime: InterviewRuntime) {
 interface FetchState {
   capabilities: Capabilities;
   runtime: InterviewRuntime;
+  connectionStateStatus: number;
   calls: Array<{ url: string; method: string; body: string | null }>;
 }
 
@@ -226,6 +227,7 @@ function installFetch(overrides: Partial<FetchState> = {}): FetchState {
   const state: FetchState = {
     capabilities,
     runtime: runtime(),
+    connectionStateStatus: 200,
     calls: [],
     ...overrides,
   };
@@ -266,7 +268,20 @@ function installFetch(overrides: Partial<FetchState> = {}): FetchState {
         timelinePush("POST /complete");
         return json(state.runtime);
       }
-      if (url.endsWith("/connection-state")) return json(state.runtime);
+      if (url.endsWith("/connection-state")) {
+        if (state.connectionStateStatus !== 200) {
+          return new Response(
+            JSON.stringify({
+              error: {
+                message:
+                  "Connection state 'reconnecting' is invalid while the interview is TRANSCRIPT_FINALIZING.",
+              },
+            }),
+            { status: state.connectionStateStatus },
+          );
+        }
+        return json(state.runtime);
+      }
       if (url.endsWith("/runtime")) return json(state.runtime);
       if (url === `/api/interviews/${interview.id}`) return json(interview);
       return json({});
@@ -855,6 +870,70 @@ describe("Dual transcription pause and recovery", () => {
     expect(
       screen.getByRole("button", { name: "Reconnect" }),
     ).toBeInTheDocument();
+  });
+
+  it("stops offering Reconnect once the server says the interview has ended", async () => {
+    const state = installFetch();
+    installMedia();
+
+    renderPage({});
+    await startVoiceInterview();
+
+    // The timer expired server-side: every "reconnecting" transition is now 409.
+    state.connectionStateStatus = 409;
+    act(() =>
+      mocks.coordinators[0].callbacks.onFatal?.(new mocks.CoordinatorError()),
+    );
+
+    expect(
+      await screen.findByText(/This interview has already ended/),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("button", { name: "Reconnect" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText(FATAL_MESSAGE)).not.toBeInTheDocument();
+  });
+
+  it("escalates from a quiet status to an alert once fallback is systematic", async () => {
+    installFetch();
+    installMedia();
+
+    renderPage({});
+    await startVoiceInterview();
+
+    const fallback = (index: number) =>
+      userTurn({
+        id: `turn-${index}`,
+        client_turn_id: `item_${index}`,
+        sequence: index,
+        transcription_source: "realtime_live",
+        transcription_model: "gpt-realtime-whisper",
+        transcription_finalized_at: "2026-08-07T00:01:05Z",
+      });
+
+    act(() =>
+      mocks.coordinators[0].callbacks.onRuntime?.(
+        runtime({ turns: [fallback(1)] }),
+      ),
+    );
+    expect(
+      await screen.findByText(/Using live transcript/),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+
+    act(() =>
+      mocks.coordinators[0].callbacks.onRuntime?.(
+        runtime({ turns: [fallback(1), fallback(2), fallback(3)] }),
+      ),
+    );
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/Using live transcript for 3 answers/);
+    expect(alert).toHaveTextContent(
+      /Final transcription is failing repeatedly/,
+    );
   });
 
   it("retries retained audio before re-enabling the microphone on reconnect", async () => {

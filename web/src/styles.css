@@ -1894,6 +1894,13 @@ h3 {
   font-size: var(--text-xs);
 }
 
+.transcription-notice.is-alert {
+  border-color: var(--color-warning);
+  color: var(--color-text);
+  background: var(--color-warning-soft);
+  font-weight: 500;
+}
+
 .interview-layout {
   display: grid;
   grid-template-columns: minmax(var(--space-0), 1.45fr) minmax(

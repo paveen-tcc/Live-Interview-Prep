@@ -56,6 +56,13 @@ interface PendingAnswer {
   started_at: string;
 }
 
+/**
+ * One fallback is routine and stays a quiet status line. A run of them means
+ * the final deployment is broken, which previously degraded an entire interview
+ * to live-quality text without ever saying so.
+ */
+const SYSTEMATIC_FALLBACK_THRESHOLD = 3;
+
 const RECORDER_UNSUPPORTED_MESSAGE =
   "This browser cannot record answer audio for final transcription. Use a recent Chrome, Edge, or Safari.";
 
@@ -129,7 +136,8 @@ export function PracticePage({
   const [error, setError] = useState<string | null>(null);
   const [liveAssistant, setLiveAssistant] = useState("");
   const [finalizing, setFinalizing] = useState(false);
-  const [liveFallbackUsed, setLiveFallbackUsed] = useState(false);
+  const [interviewEnded, setInterviewEnded] = useState(false);
+  const [liveFallbackCount, setLiveFallbackCount] = useState(0);
   const [remainingSeconds, setRemainingSeconds] = useState(duration * 60);
   const audioRef = useRef<HTMLAudioElement>(null);
   const transcriptStreamRef = useRef<HTMLDivElement>(null);
@@ -321,9 +329,9 @@ export function PracticePage({
 
   function applyRuntime(nextRuntime: InterviewRuntime) {
     setRuntime(nextRuntime);
-    if (nextRuntime.turns.some(isAcceptedLiveFallback)) {
-      setLiveFallbackUsed(true);
-    }
+    setLiveFallbackCount(
+      nextRuntime.turns.filter(isAcceptedLiveFallback).length,
+    );
     void flushDeliveryObservations(nextRuntime);
   }
 
@@ -398,7 +406,27 @@ export function PracticePage({
     setError(reason ?? COORDINATOR_FATAL_MESSAGE);
     void api
       .connectionState(interview.id, "reconnecting")
-      .catch(() => undefined);
+      .catch((caught: unknown) => markEndedIfServerRefused(caught));
+  }
+
+  /**
+   * The server only accepts a "reconnecting" transition while the interview is
+   * still live. Once the timer has expired it answers 409 forever, so treating
+   * that as retryable left the room offering a Reconnect button that could
+   * never succeed. Reconcile to the ended state instead.
+   */
+  function markEndedIfServerRefused(caught: unknown): boolean {
+    if (!(caught instanceof ApiError) || caught.status !== 409) return false;
+    stoppedRef.current = true;
+    transportRef.current?.setMicrophoneEnabled(false);
+    transportRef.current?.close(true);
+    setConnection("idle");
+    setFinalizing(false);
+    setError(
+      "This interview has already ended. Your transcript is saved — open the report to continue.",
+    );
+    setInterviewEnded(true);
+    return true;
   }
 
   async function flushRetainedAssistant() {
@@ -569,7 +597,7 @@ export function PracticePage({
   }
 
   async function connect() {
-    if (!capabilities || !audioRef.current) return;
+    if (!capabilities || !audioRef.current || interviewEnded) return;
     setError(null);
     setConnection(initialConnectionRef.current ? "connecting" : "reconnecting");
     setPhase("interview");
@@ -590,7 +618,12 @@ export function PracticePage({
         ensureTranscriptionUnits(mediaRef.current);
       }
       if (runtime?.started_at && runtime.status === "IN_PROGRESS") {
-        await api.connectionState(interview.id, "reconnecting");
+        try {
+          await api.connectionState(interview.id, "reconnecting");
+        } catch (caught) {
+          if (markEndedIfServerRefused(caught)) return;
+          throw caught;
+        }
       }
       const secret = await api.realtimeClientSecret(
         interview.id,
@@ -605,7 +638,9 @@ export function PracticePage({
           if (stoppedRef.current) return;
           if (state === "failed" || state === "disconnected") {
             setConnection("reconnecting");
-            void api.connectionState(interview.id, "reconnecting");
+            void api
+              .connectionState(interview.id, "reconnecting")
+              .catch((caught: unknown) => markEndedIfServerRefused(caught));
           }
           if (state === "closed") setConnection("failed");
         },
@@ -668,6 +703,7 @@ export function PracticePage({
         mediaStream: mediaRef.current,
       });
     } catch (caught) {
+      if (markEndedIfServerRefused(caught)) return;
       setConnection("failed");
       void api.connectionState(interview.id, "failed").catch(() => undefined);
       setError(
@@ -991,7 +1027,8 @@ export function PracticePage({
               <strong>{formatTimer(remainingSeconds)}</strong>
             </div>
             <div className="interview-controls">
-              {connection === "reconnecting" || connection === "failed" ? (
+              {!interviewEnded &&
+              (connection === "reconnecting" || connection === "failed") ? (
                 <button className="btn btn--sm" type="button" onClick={connect}>
                   <RefreshIcon size={16} /> Reconnect
                 </button>
@@ -1019,10 +1056,18 @@ export function PracticePage({
               </button>
             </div>
           ) : null}
-          {liveFallbackUsed ? (
+          {liveFallbackCount >= SYSTEMATIC_FALLBACK_THRESHOLD ? (
+            <p className="transcription-notice is-alert" role="alert">
+              Using live transcript for {liveFallbackCount} answers. Final
+              transcription is failing repeatedly, so this transcript is less
+              accurate than usual. Check the final transcription deployment
+              before relying on the report.
+            </p>
+          ) : liveFallbackCount > 0 ? (
             <p className="transcription-notice" role="status">
-              Using live transcript for at least one answer. The interview is
-              still connected.
+              Using live transcript for{" "}
+              {liveFallbackCount === 1 ? "one answer" : "some answers"}. The
+              interview is still connected.
             </p>
           ) : null}
           <div className="interview-layout">
