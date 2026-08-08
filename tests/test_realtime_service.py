@@ -39,6 +39,17 @@ def test_dual_transcription_configuration_uses_explicit_deployment_names() -> No
     assert settings.final_transcription_configured is True
 
 
+def test_live_transcription_is_not_configured_without_a_deployment_name() -> None:
+    settings = Settings(
+        _env_file=None,
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+    )
+
+    assert settings.live_transcription_configured is False
+
+
 @pytest.mark.asyncio
 async def test_client_secret_uses_ga_contract_without_exposing_server_key() -> None:
     observed: dict[str, object] = {}
@@ -97,6 +108,27 @@ async def test_voice_secret_configures_vad_and_input_transcription() -> None:
         "language": "en",
         "delay": "low",
     }
+
+
+@pytest.mark.asyncio
+async def test_voice_secret_requires_a_configured_live_transcription_deployment(
+) -> None:
+    settings = Settings(
+        _env_file=None,
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+    )
+
+    with pytest.raises(RealtimeServiceError) as caught:
+        await create_realtime_client_secret(
+            settings=settings,
+            instructions="prompt",
+            input_mode="voice",
+        )
+
+    assert caught.value.status_code == 503
+    assert "input transcription" in str(caught.value).lower()
 
 
 @pytest.mark.asyncio

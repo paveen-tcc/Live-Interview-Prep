@@ -64,6 +64,12 @@ async def create_realtime_client_secret(
             "Azure Realtime is not configured. Add the Realtime deployment name.",
             status_code=503,
         )
+    if input_mode == "voice" and not settings.live_transcription_configured:
+        raise RealtimeServiceError(
+            "Azure Realtime input transcription is not configured. "
+            "Add the live transcription deployment name.",
+            status_code=503,
+        )
 
     root = azure_resource_root(settings.azure_openai_endpoint or "")
     session: dict[str, object] = {

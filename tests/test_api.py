@@ -645,7 +645,7 @@ def test_m3_text_realtime_flow_is_private_long_and_idempotent(
         assert capabilities == {
             "text_dev_mode_enabled": True,
             "realtime_configured": True,
-            "live_transcription_configured": True,
+            "live_transcription_configured": False,
             "final_transcription_configured": False,
             "typed_answer_max_characters": 20_000,
             "supported_durations": [15, 30, 45, 60],

@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     azure_openai_text_deployment: str = "gpt-5.6-luna"
     azure_openai_realtime_deployment: str | None = None
     azure_openai_realtime_voice: str = "marin"
-    azure_openai_realtime_transcription_model: str = "gpt-4o-mini-transcribe"
+    azure_openai_realtime_transcription_model: str | None = None
     azure_openai_final_transcription_deployment: str | None = None
     azure_openai_transcription_language: str = "en"
     azure_openai_transcription_delay: Literal[
@@ -128,7 +128,7 @@ class Settings(BaseSettings):
         return bool(
             (self.azure_openai_endpoint or "").strip()
             and key
-            and self.azure_openai_realtime_transcription_model.strip()
+            and (self.azure_openai_realtime_transcription_model or "").strip()
         )
 
     @property
