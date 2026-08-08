@@ -4,6 +4,96 @@ const ALLOWED_MIME_TYPES = [
   "audio/ogg;codecs=opus",
 ] as const;
 
+/**
+ * Every container these recorders produce is a header followed by a stream of
+ * independently-framed media units. `MediaRecorder` emits that header exactly
+ * once, in its first chunk. An utterance assembled from later chunks is
+ * therefore headerless and undecodable — which is why final transcription
+ * rejected every candidate answer while the recorder's own tests passed: they
+ * asserted which chunks landed in a segment, never that the result decoded.
+ *
+ * These readers locate where the header ends so it can be retained once and
+ * prepended to every utterance, without duplicating any audio.
+ */
+function findWebmInitLength(bytes: Uint8Array): number {
+  // The header runs until the first Cluster element (ID 0x1F43B675).
+  for (let index = 0; index + 3 < bytes.length; index += 1) {
+    if (
+      bytes[index] === 0x1f &&
+      bytes[index + 1] === 0x43 &&
+      bytes[index + 2] === 0xb6 &&
+      bytes[index + 3] === 0x75
+    ) {
+      return index;
+    }
+  }
+  return 0;
+}
+
+function findMp4InitLength(bytes: Uint8Array): number {
+  // Walk top-level boxes; ftyp + moov are the header, the first moof starts media.
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let offset = 0;
+  while (offset + 8 <= bytes.length) {
+    let size = view.getUint32(offset);
+    const type = String.fromCharCode(
+      bytes[offset + 4],
+      bytes[offset + 5],
+      bytes[offset + 6],
+      bytes[offset + 7],
+    );
+    if (type === "moof" || type === "mdat") return offset;
+    if (size === 1) {
+      if (offset + 16 > bytes.length) return 0;
+      size = Number(view.getBigUint64(offset + 8));
+    }
+    if (size <= 0) return 0;
+    offset += size;
+  }
+  return 0;
+}
+
+function findOggInitLength(bytes: Uint8Array): number {
+  // OpusHead and OpusTags occupy the first two pages; audio begins at the third.
+  let pages = 0;
+  for (let index = 0; index + 3 < bytes.length; index += 1) {
+    if (
+      bytes[index] === 0x4f &&
+      bytes[index + 1] === 0x67 &&
+      bytes[index + 2] === 0x67 &&
+      bytes[index + 3] === 0x53
+    ) {
+      pages += 1;
+      if (pages === 3) return index;
+    }
+  }
+  return 0;
+}
+
+/** jsdom's Blob predates `arrayBuffer`, so fall back to FileReader there. */
+async function readBlobBytes(blob: Blob): Promise<Uint8Array> {
+  if (typeof blob.arrayBuffer === "function") {
+    return new Uint8Array(await blob.arrayBuffer());
+  }
+  return new Promise<Uint8Array>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(new Uint8Array(reader.result as ArrayBuffer));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsArrayBuffer(blob);
+  });
+}
+
+export function initSegmentLength(
+  mediaType: string,
+  bytes: Uint8Array,
+): number {
+  const type = mediaType.toLowerCase();
+  if (type.includes("webm")) return findWebmInitLength(bytes);
+  if (type.includes("mp4")) return findMp4InitLength(bytes);
+  if (type.includes("ogg")) return findOggInitLength(bytes);
+  return 0;
+}
+
 const DEFAULT_PREBUFFER_CHUNKS = 6;
 const DEFAULT_TAIL_MS = 300;
 const DEFAULT_MAX_QUEUED = 2;
@@ -58,6 +148,9 @@ export class BufferedUtteranceRecorder {
   private finishing = false;
   private finishResolve: (() => void) | null = null;
   private finishPromise: Promise<void> | null = null;
+  private initSegment: Blob | null = null;
+  private initPending: Promise<void> | null = null;
+  private pendingDeliveries = 0;
 
   constructor(
     private readonly stream: MediaStream,
@@ -149,7 +242,7 @@ export class BufferedUtteranceRecorder {
       this.recorder.requestData();
     }
 
-    if (this.segments.size === 0) {
+    if (this.segments.size === 0 && this.pendingDeliveries === 0) {
       this.stopRecording();
     }
 
@@ -162,6 +255,13 @@ export class BufferedUtteranceRecorder {
 
   private captureChunk(chunk: Blob): void {
     if (!this.recorder || chunk.size === 0) {
+      return;
+    }
+
+    if (this.initPending === null) {
+      // The first chunk carries the container header. Its ~250ms of audio
+      // precedes any speech, so only the header is kept.
+      this.initPending = this.retainInitSegment(chunk);
       return;
     }
 
@@ -197,20 +297,48 @@ export class BufferedUtteranceRecorder {
 
     const chunks = segment.chunks;
     segment.chunks = [];
-    const mediaType = this.mediaType ?? ALLOWED_MIME_TYPES[0];
-    const utterance: RecordedUtterance = {
-      itemId,
-      blob: new Blob(chunks, { type: mediaType }),
-      mediaType,
-      startedAt: segment.startedAt,
-      endedAt: new Date().toISOString(),
-    };
-    chunks.length = 0;
+    this.pendingDeliveries += 1;
+    void this.deliverUtterance(itemId, chunks, segment.startedAt);
+  }
 
+  private async retainInitSegment(chunk: Blob): Promise<void> {
+    const mediaType = this.mediaType ?? ALLOWED_MIME_TYPES[0];
     try {
+      const bytes = await readBlobBytes(chunk);
+      const length = initSegmentLength(mediaType, bytes);
+      // A container this reader does not recognise keeps the whole first chunk:
+      // a decodable utterance with a duplicated opening beats an undecodable one.
+      this.initSegment = length > 0 ? chunk.slice(0, length) : chunk;
+    } catch {
+      this.initSegment = chunk;
+    }
+  }
+
+  private async deliverUtterance(
+    itemId: string,
+    chunks: Blob[],
+    startedAt: string,
+  ): Promise<void> {
+    try {
+      await this.initPending;
+      const mediaType = this.mediaType ?? ALLOWED_MIME_TYPES[0];
+      const parts = this.initSegment ? [this.initSegment, ...chunks] : chunks;
+      const utterance: RecordedUtterance = {
+        itemId,
+        blob: new Blob(parts, { type: mediaType }),
+        mediaType,
+        startedAt,
+        endedAt: new Date().toISOString(),
+      };
+      chunks.length = 0;
       this.callbacks.onUtterance(utterance);
     } finally {
-      if (this.finishing && this.segments.size === 0) {
+      this.pendingDeliveries -= 1;
+      if (
+        this.finishing &&
+        this.segments.size === 0 &&
+        this.pendingDeliveries === 0
+      ) {
         this.stopRecording();
       }
     }
@@ -229,6 +357,8 @@ export class BufferedUtteranceRecorder {
     }
     this.segments.clear();
     this.prebuffer.length = 0;
+    this.initSegment = null;
+    this.initPending = null;
     this.finishing = false;
 
     const resolve = this.finishResolve;
