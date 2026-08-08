@@ -126,6 +126,13 @@ class InterviewTurn(Base):
     sequence: Mapped[int] = mapped_column(Integer)
     speaker: Mapped[str] = mapped_column(String(16))
     transcript: Mapped[str] = mapped_column(Text)
+    transcription_source: Mapped[str] = mapped_column(
+        String(24), default="legacy", server_default="legacy"
+    )
+    transcription_model: Mapped[str | None] = mapped_column(String(160))
+    transcription_finalized_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
     delivery_status: Mapped[str] = mapped_column(String(20), default="acknowledged")
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now

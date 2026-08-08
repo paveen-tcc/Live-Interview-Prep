@@ -698,7 +698,11 @@ def test_m3_text_realtime_flow_is_private_long_and_idempotent(
         )
         assert pending.status_code == 200
         assert len(pending.json()["turns"]) == 1
-        assert pending.json()["turns"][0]["delivery_status"] == "pending"
+        legacy_turn = pending.json()["turns"][0]
+        assert legacy_turn["delivery_status"] == "pending"
+        assert legacy_turn["transcription_source"] == "legacy"
+        assert legacy_turn["transcription_model"] is None
+        assert legacy_turn["transcription_finalized_at"] is None
 
         pending_payload["items"][0]["delivery_status"] = "acknowledged"
         acknowledged = realtime_client.post(
@@ -1363,6 +1367,15 @@ def test_migrations_upgrade_and_roll_back(
         "deletion_receipts",
         "alembic_version",
     } <= tables
+    with sqlite3.connect(database_path) as connection:
+        interview_turn_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(interview_turns)")
+        }
+    assert {
+        "transcription_source",
+        "transcription_model",
+        "transcription_finalized_at",
+    } <= interview_turn_columns
 
     command.downgrade(configuration, "base")
     with sqlite3.connect(database_path) as connection:

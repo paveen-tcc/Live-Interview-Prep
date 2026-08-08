@@ -58,6 +58,9 @@ class InterviewTurnResponse(BaseModel):
     sequence: int
     speaker: Speaker
     transcript: str
+    transcription_source: str
+    transcription_model: str | None
+    transcription_finalized_at: datetime | None
     delivery_status: DeliveryStatus
     started_at: datetime
     ended_at: datetime | None

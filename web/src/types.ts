@@ -117,6 +117,14 @@ export interface InterviewTurn {
   sequence: number;
   speaker: "user" | "assistant";
   transcript: string;
+  transcription_source:
+    | "typed"
+    | "realtime_live"
+    | "final_model"
+    | "assistant"
+    | "legacy";
+  transcription_model: string | null;
+  transcription_finalized_at: string | null;
   delivery_status: "pending" | "acknowledged";
   started_at: string;
   ended_at: string | null;
