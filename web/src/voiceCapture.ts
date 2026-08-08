@@ -1,7 +1,7 @@
 const ALLOWED_MIME_TYPES = [
   "audio/webm;codecs=opus",
-  "audio/webm",
   "audio/mp4",
+  "audio/ogg;codecs=opus",
 ] as const;
 
 const DEFAULT_PREBUFFER_CHUNKS = 6;
@@ -83,6 +83,10 @@ export class BufferedUtteranceRecorder {
     try {
       const recorder = new MediaRecorder(this.stream, { mimeType: mediaType });
       recorder.ondataavailable = (event) => this.captureChunk(event.data);
+      recorder.onerror = () => {
+        this.stopRecording();
+        this.callbacks.onError("Audio capture failed.");
+      };
       recorder.start(250);
       this.recorder = recorder;
       this.mediaType = mediaType;
@@ -193,7 +197,7 @@ export class BufferedUtteranceRecorder {
 
     const chunks = segment.chunks;
     segment.chunks = [];
-    const mediaType = this.mediaType ?? "audio/webm";
+    const mediaType = this.mediaType ?? ALLOWED_MIME_TYPES[0];
     const utterance: RecordedUtterance = {
       itemId,
       blob: new Blob(chunks, { type: mediaType }),
@@ -233,6 +237,7 @@ export class BufferedUtteranceRecorder {
 
     if (recorder) {
       recorder.ondataavailable = null;
+      recorder.onerror = null;
       recorder.onstop = null;
       if (recorder.state !== "inactive") {
         recorder.stop();

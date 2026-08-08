@@ -10,8 +10,8 @@ class FakeMediaRecorder {
 
   static supportedMimeTypes = new Set<string>([
     "audio/webm;codecs=opus",
-    "audio/webm",
     "audio/mp4",
+    "audio/ogg;codecs=opus",
   ]);
 
   static isTypeSupported(mimeType: string): boolean {
@@ -31,6 +31,7 @@ class FakeMediaRecorder {
   readonly requestData = vi.fn();
 
   ondataavailable: ((event: BlobEvent) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
   onstop: ((event: Event) => void) | null = null;
   state: RecordingState = "inactive";
   timeslice?: number;
@@ -44,6 +45,10 @@ class FakeMediaRecorder {
 
   emit(blob: Blob): void {
     this.ondataavailable?.({ data: blob } as BlobEvent);
+  }
+
+  fail(): void {
+    this.onerror?.(new Event("error"));
   }
 }
 
@@ -59,8 +64,8 @@ describe("BufferedUtteranceRecorder", () => {
     FakeMediaRecorder.instances = [];
     FakeMediaRecorder.supportedMimeTypes = new Set([
       "audio/webm;codecs=opus",
-      "audio/webm",
       "audio/mp4",
+      "audio/ogg;codecs=opus",
     ]);
     vi.stubGlobal("MediaRecorder", FakeMediaRecorder);
   });
@@ -74,8 +79,14 @@ describe("BufferedUtteranceRecorder", () => {
     expect(selectRecorderMimeType()).toBe("audio/webm;codecs=opus");
   });
 
+  it("falls back to Opus Ogg after WebM and MP4 are unavailable", () => {
+    FakeMediaRecorder.supportedMimeTypes = new Set(["audio/ogg;codecs=opus"]);
+
+    expect(selectRecorderMimeType()).toBe("audio/ogg;codecs=opus");
+  });
+
   it("reports an unsupported browser when no allowlisted MIME type is available", () => {
-    FakeMediaRecorder.supportedMimeTypes.clear();
+    FakeMediaRecorder.supportedMimeTypes = new Set(["audio/webm"]);
     const handlers = callbacks();
     const recorder = new BufferedUtteranceRecorder(stream, handlers);
 
@@ -219,6 +230,36 @@ describe("BufferedUtteranceRecorder", () => {
     vi.advanceTimersByTime(300);
 
     expect(firstRecorder.stop).toHaveBeenCalledOnce();
+    expect(handlers.onUtterance).toHaveBeenCalledTimes(1);
+    expect(handlers.onUtterance.mock.calls[0][0]).toMatchObject({
+      itemId: "voice-item-2",
+    });
+    expect(handlers.onUtterance.mock.calls[0][0].blob.size).toBe(4);
+  });
+
+  it("clears buffered audio and stale handlers before reporting a recorder error", () => {
+    const handlers = callbacks();
+    const recorder = new BufferedUtteranceRecorder(stream, handlers);
+    recorder.start();
+    const firstRecorder = FakeMediaRecorder.instances[0];
+
+    firstRecorder.emit(new Blob(["prebuffer"], { type: "audio/webm" }));
+    recorder.speechStarted("voice-item-1");
+    firstRecorder.emit(new Blob(["discard"], { type: "audio/webm" }));
+    recorder.speechStopped("voice-item-1");
+    firstRecorder.fail();
+    firstRecorder.emit(new Blob(["stale"], { type: "audio/webm" }));
+    vi.advanceTimersByTime(300);
+
+    recorder.start();
+    const secondRecorder = FakeMediaRecorder.instances[1];
+    recorder.speechStarted("voice-item-2");
+    secondRecorder.emit(new Blob(["keep"], { type: "audio/webm" }));
+    recorder.speechStopped("voice-item-2");
+    vi.advanceTimersByTime(300);
+
+    expect(firstRecorder.stop).toHaveBeenCalledOnce();
+    expect(handlers.onError).toHaveBeenCalledWith("Audio capture failed.");
     expect(handlers.onUtterance).toHaveBeenCalledTimes(1);
     expect(handlers.onUtterance.mock.calls[0][0]).toMatchObject({
       itemId: "voice-item-2",
