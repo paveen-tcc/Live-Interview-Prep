@@ -212,6 +212,17 @@ async def _finalized_input(
         .order_by(InterviewTurn.sequence)
     )
     persisted_turns = list(result)
+    if interview.input_mode == "voice" and any(
+        turn.speaker == "user"
+        and turn.transcription_source != "legacy"
+        and turn.transcription_finalized_at is None
+        for turn in persisted_turns
+    ):
+        raise EvaluationServiceError(
+            "The transcript still has a candidate answer awaiting transcription "
+            "finalization. Retry final transcription or accept the live fallback.",
+            status_code=409,
+        )
     if any(
         turn.speaker == "user" and turn.delivery_status != "acknowledged"
         for turn in persisted_turns

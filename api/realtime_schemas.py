@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -78,3 +79,13 @@ class InterviewRuntimeResponse(BaseModel):
     server_now: datetime
     typed_answer_max_characters: int
     turns: list[InterviewTurnResponse]
+
+
+class TranscriptionEventRequest(BaseModel):
+    kind: Literal[
+        "live_transcription_completed",
+        "live_transcription_failed",
+        "double_transcription_failure",
+    ]
+
+    model_config = ConfigDict(extra="forbid")

@@ -26,6 +26,7 @@ from api.database import (
 )
 from api.main import create_app
 from api.services.realtime import RealtimeClientSecret
+from api.services.transcription import FinalTranscription, TranscriptionServiceError
 from domain.evaluation import (
     CompetencyEvaluation,
     EvaluationReport,
@@ -173,9 +174,13 @@ def client(settings: Settings):
         yield test_client
 
 
-def _create_session(client: TestClient) -> dict[str, object]:
+def _create_session(
+    client: TestClient, *, headers: dict[str, str] | None = None
+) -> dict[str, object]:
     response = client.post(
-        "/api/interviews", json={"title": "Untitled practice session"}
+        "/api/interviews",
+        json={"title": "Untitled practice session"},
+        headers=headers,
     )
     assert response.status_code == 201
     return response.json()
@@ -197,8 +202,10 @@ def _docx_bytes() -> bytes:
     return output.getvalue()
 
 
-def _ready_session(client: TestClient) -> dict[str, object]:
-    interview = _create_session(client)
+def _ready_session(
+    client: TestClient, *, headers: dict[str, str] | None = None
+) -> dict[str, object]:
+    interview = _create_session(client, headers=headers)
     upload = client.post(
         "/api/uploads/resume",
         data={"interview_id": interview["id"]},
@@ -210,10 +217,12 @@ def _ready_session(client: TestClient) -> dict[str, object]:
                 "wordprocessingml.document",
             )
         },
+        headers=headers,
     ).json()
     client.post(
         "/api/candidate-profiles/extract",
         json={"interview_id": interview["id"], "upload_id": upload["id"]},
+        headers=headers,
     )
     target = client.post(
         "/api/job-targets",
@@ -226,12 +235,47 @@ def _ready_session(client: TestClient) -> dict[str, object]:
                 "testing, observability, incident response, and team ownership."
             ),
         },
+        headers=headers,
     ).json()
     client.post(
         "/api/scorecards/generate",
         json={"interview_id": interview["id"], "job_target_id": target["id"]},
+        headers=headers,
     )
     return interview
+
+
+def _start_ready_interview(
+    client: TestClient,
+    interview_id: object,
+    *,
+    input_mode: str,
+    headers: dict[str, str] | None = None,
+) -> None:
+    secret = client.post(
+        f"/api/interviews/{interview_id}/realtime-client-secret",
+        json={
+            "input_mode": input_mode,
+            "duration_minutes": 15,
+            "interview_type": "technical_behavioral",
+        },
+        headers=headers,
+    )
+    assert secret.status_code == 200
+    connected = client.post(
+        f"/api/interviews/{interview_id}/connection-state",
+        json={"state": "connected"},
+        headers=headers,
+    )
+    assert connected.status_code == 200
+
+
+async def _fake_realtime_secret(**_kwargs: object) -> RealtimeClientSecret:
+    return RealtimeClientSecret(
+        value="ek_temporary",
+        expires_at=2_000_000_000,
+        calls_url="https://example.invalid/openai/v1/realtime/calls",
+    )
 
 
 def _pdf_bytes(*, text: str | None = None, encrypted: bool = False) -> bytes:
@@ -609,6 +653,564 @@ def test_capabilities_expose_only_safe_dual_transcription_configuration(
     assert "server-key" not in serialized_body
 
 
+def test_final_transcription_upgrades_live_turn_once_and_late_live_is_noop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "dual-convergence.db"
+    transcription_settings = Settings(
+        _env_file=None,
+        app_env="test",
+        auth_mode="local",
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
+        azure_openai_final_transcription_deployment="final-stt-deployment",
+    )
+    provider_calls: list[dict[str, object]] = []
+
+    async def fake_transcription(**kwargs: object) -> FinalTranscription:
+        provider_calls.append(kwargs)
+        return FinalTranscription(
+            text="I designed an idempotent payment API.",
+            deployment="final-stt-deployment",
+            elapsed_ms=2_400,
+            attempts=2,
+        )
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime.transcribe_candidate_audio",
+        fake_transcription,
+    )
+    with TestClient(create_app(transcription_settings)) as transcription_client:
+        interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, interview["id"], input_mode="voice"
+        )
+        live = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns:batch",
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "assistant-question",
+                        "speaker": "assistant",
+                        "transcript": "Describe an API you designed.",
+                    },
+                    {
+                        "client_turn_id": "candidate-answer",
+                        "speaker": "user",
+                        "transcript": "I designed a payment service.",
+                    },
+                ]
+            },
+        )
+        assert live.status_code == 200
+        assistant_turn, live_turn = live.json()["turns"]
+        assert assistant_turn["transcription_source"] == "assistant"
+        assert assistant_turn["transcription_model"] is None
+        assert assistant_turn["transcription_finalized_at"] is not None
+        assert live_turn["transcription_source"] == "realtime_live"
+        assert live_turn["transcription_model"] == "live-stt-deployment"
+        assert live_turn["transcription_finalized_at"] is None
+
+        finalized = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/candidate-answer:transcribe",
+            files={
+                "file": (
+                    "candidate.webm",
+                    b"candidate-audio",
+                    "audio/webm; codecs=opus",
+                )
+            },
+        )
+        repeated = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/candidate-answer:transcribe",
+            files={"file": ("retry.webm", b"different-audio", "audio/webm")},
+        )
+
+        assert finalized.status_code == repeated.status_code == 200
+        final_turn = finalized.json()
+        assert final_turn["id"] == live_turn["id"]
+        assert final_turn["sequence"] == live_turn["sequence"]
+        assert final_turn["transcript"] == "I designed an idempotent payment API."
+        assert final_turn["transcription_source"] == "final_model"
+        assert final_turn["transcription_model"] == "final-stt-deployment"
+        assert final_turn["transcription_finalized_at"] is not None
+        assert repeated.json() == final_turn
+        assert len(provider_calls) == 1
+        assert provider_calls[0]["audio"] == b"candidate-audio"
+        assert provider_calls[0]["media_type"] == "audio/webm"
+
+        late_live = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns:batch",
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "candidate-answer",
+                        "speaker": "user",
+                        "transcript": "A late and less accurate live transcript.",
+                    }
+                ]
+            },
+        )
+        assert late_live.status_code == 200
+        saved_turn = next(
+            turn
+            for turn in late_live.json()["turns"]
+            if turn["client_turn_id"] == "candidate-answer"
+        )
+        assert saved_turn == final_turn
+
+        pre_boundary_live = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns:batch",
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "pre-boundary-live",
+                        "speaker": "user",
+                        "transcript": "This live turn existed before completion.",
+                    }
+                ]
+            },
+        )
+        assert pre_boundary_live.status_code == 200
+        transcription_client.post(f"/api/interviews/{interview['id']}/complete")
+        finalized_after_end = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/pre-boundary-live:transcribe",
+            files={"file": ("saved.webm", b"saved-audio", "audio/webm")},
+        )
+        after_end = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/candidate-answer:transcribe",
+            files={"file": ("retry.webm", b"retry", "audio/webm")},
+        )
+        new_after_end = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/new-answer:transcribe",
+            files={"file": ("late.webm", b"late", "audio/webm")},
+        )
+        assert finalized_after_end.status_code == after_end.status_code == 200
+        assert finalized_after_end.json()["transcription_source"] == "final_model"
+        assert after_end.json() == final_turn
+        assert new_after_end.status_code == 409
+        assert len(provider_calls) == 2
+
+    with sqlite3.connect(database_path) as connection:
+        events = connection.execute(
+            "SELECT kind, quantity FROM usage_events WHERE session_id = ?",
+            (interview["id"],),
+        ).fetchall()
+    assert events.count(("final_transcription_completed", 1)) == 2
+
+
+def test_final_first_transcription_is_not_replaced_by_late_live_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcription_settings = Settings(
+        _env_file=None,
+        app_env="test",
+        auth_mode="local",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'final-first.db'}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
+        azure_openai_final_transcription_deployment="final-stt-deployment",
+    )
+
+    async def fake_transcription(**_kwargs: object) -> FinalTranscription:
+        return FinalTranscription(
+            text="The final transcript arrived first.",
+            deployment="final-stt-deployment",
+            elapsed_ms=400,
+            attempts=1,
+        )
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime.transcribe_candidate_audio",
+        fake_transcription,
+    )
+    with TestClient(create_app(transcription_settings)) as transcription_client:
+        interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, interview["id"], input_mode="voice"
+        )
+        finalized = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/final-first:transcribe",
+            files={"file": ("answer.ogg", b"audio", "audio/ogg")},
+        )
+        late_live = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns:batch",
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "final-first",
+                        "speaker": "user",
+                        "transcript": "The live transcript arrived late.",
+                    }
+                ]
+            },
+        )
+
+    assert finalized.status_code == late_live.status_code == 200
+    assert len(late_live.json()["turns"]) == 1
+    assert late_live.json()["turns"][0] == finalized.json()
+
+
+def test_final_transcription_rejects_invalid_input_before_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcription_settings = Settings(
+        _env_file=None,
+        app_env="test",
+        auth_mode="local",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'transcription-input.db'}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+        enable_text_dev_mode=True,
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
+        azure_openai_final_transcription_deployment="final-stt-deployment",
+        azure_openai_final_transcription_max_bytes=4,
+    )
+    provider_calls = 0
+
+    async def forbidden_provider(**_kwargs: object) -> FinalTranscription:
+        nonlocal provider_calls
+        provider_calls += 1
+        raise AssertionError("validation must happen before provider invocation")
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime.transcribe_candidate_audio",
+        forbidden_provider,
+    )
+    with TestClient(create_app(transcription_settings)) as transcription_client:
+        text_interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, text_interview["id"], input_mode="text_dev"
+        )
+        text_mode = transcription_client.post(
+            f"/api/interviews/{text_interview['id']}/turns/answer:transcribe",
+            files={"file": ("answer.webm", b"data", "audio/webm")},
+        )
+
+        voice_interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, voice_interview["id"], input_mode="voice"
+        )
+        invalid_mime = transcription_client.post(
+            f"/api/interviews/{voice_interview['id']}/turns/answer:transcribe",
+            files={"file": ("answer.wav", b"data", "audio/wav")},
+        )
+        empty = transcription_client.post(
+            f"/api/interviews/{voice_interview['id']}/turns/answer:transcribe",
+            files={"file": ("answer.mp4", b"", "audio/mp4")},
+        )
+        oversized = transcription_client.post(
+            f"/api/interviews/{voice_interview['id']}/turns/answer:transcribe",
+            files={"file": ("answer.ogg", b"12345", "audio/ogg")},
+        )
+
+    assert text_mode.status_code == 409
+    assert invalid_mime.status_code == 415
+    assert empty.status_code == 422
+    assert oversized.status_code == 413
+    assert provider_calls == 0
+
+
+def test_accept_live_finalizes_only_owned_live_candidate_turns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "accept-live.db"
+    transcription_settings = Settings(
+        _env_file=None,
+        app_env="test",
+        auth_mode="easy_auth",
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+        enable_text_dev_mode=True,
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    owner = _principal_headers("turn-owner", "owner@example.test")
+    stranger = _principal_headers("turn-stranger", "stranger@example.test")
+    with TestClient(create_app(transcription_settings)) as transcription_client:
+        voice_interview = _ready_session(transcription_client, headers=owner)
+        _start_ready_interview(
+            transcription_client,
+            voice_interview["id"],
+            input_mode="voice",
+            headers=owner,
+        )
+        turns = transcription_client.post(
+            f"/api/interviews/{voice_interview['id']}/turns:batch",
+            headers=owner,
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "assistant-turn",
+                        "speaker": "assistant",
+                        "transcript": "Tell me about a project.",
+                    },
+                    {
+                        "client_turn_id": "live-turn",
+                        "speaker": "user",
+                        "transcript": "I built a reliable API.",
+                    },
+                ]
+            },
+        )
+        assert turns.status_code == 200
+        accepted = transcription_client.post(
+            f"/api/interviews/{voice_interview['id']}/turns/live-turn:accept-live",
+            headers=owner,
+        )
+        repeated = transcription_client.post(
+            f"/api/interviews/{voice_interview['id']}/turns/live-turn:accept-live",
+            headers=owner,
+        )
+        assistant = transcription_client.post(
+            f"/api/interviews/{voice_interview['id']}/turns/assistant-turn:accept-live",
+            headers=owner,
+        )
+        missing = transcription_client.post(
+            f"/api/interviews/{voice_interview['id']}/turns/missing-turn:accept-live",
+            headers=owner,
+        )
+        foreign = transcription_client.post(
+            f"/api/interviews/{voice_interview['id']}/turns/live-turn:accept-live",
+            headers=stranger,
+        )
+
+        text_interview = _ready_session(transcription_client, headers=owner)
+        _start_ready_interview(
+            transcription_client,
+            text_interview["id"],
+            input_mode="text_dev",
+            headers=owner,
+        )
+        transcription_client.post(
+            f"/api/interviews/{text_interview['id']}/turns:batch",
+            headers=owner,
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "typed-turn",
+                        "speaker": "user",
+                        "transcript": "This was typed.",
+                    }
+                ]
+            },
+        )
+        typed = transcription_client.post(
+            f"/api/interviews/{text_interview['id']}/turns/typed-turn:accept-live",
+            headers=owner,
+        )
+
+    assert accepted.status_code == repeated.status_code == 200
+    assert accepted.json() == repeated.json()
+    assert accepted.json()["transcription_source"] == "realtime_live"
+    assert accepted.json()["transcript"] == "I built a reliable API."
+    assert accepted.json()["transcription_finalized_at"] is not None
+    assert assistant.status_code == typed.status_code == 409
+    assert missing.status_code == foreign.status_code == 404
+    with sqlite3.connect(database_path) as connection:
+        fallback_events = connection.execute(
+            "SELECT kind, quantity FROM usage_events WHERE session_id = ?",
+            (voice_interview["id"],),
+        ).fetchall()
+    assert fallback_events.count(("live_transcription_fallback", 1)) == 1
+
+
+def test_transcription_errors_and_telemetry_are_content_free(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    database_path = tmp_path / "transcription-telemetry.db"
+    transcription_settings = Settings(
+        _env_file=None,
+        app_env="test",
+        auth_mode="local",
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
+        azure_openai_final_transcription_deployment="final-stt-deployment",
+    )
+    provider_attempt = 0
+
+    async def failed_transcription(**_kwargs: object) -> FinalTranscription:
+        nonlocal provider_attempt
+        provider_attempt += 1
+        if provider_attempt == 2:
+            raise RuntimeError("provider response body: secret upstream payload")
+        raise TranscriptionServiceError(
+            "Final transcription is temporarily unavailable. Try again.",
+            code="transcription_unavailable",
+            status_code=502,
+            attempts=3,
+        )
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime.transcribe_candidate_audio",
+        failed_transcription,
+    )
+    caplog.set_level("INFO")
+    with TestClient(create_app(transcription_settings)) as transcription_client:
+        interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, interview["id"], input_mode="voice"
+        )
+        failure = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/failed-turn:transcribe",
+            files={
+                "file": (
+                    "private-answer.webm",
+                    b"private-candidate-audio",
+                    "audio/webm",
+                )
+            },
+        )
+        unexpected_failure = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/unexpected-failure:transcribe",
+            files={"file": ("answer.ogg", b"other-private-audio", "audio/ogg")},
+        )
+        allowed = transcription_client.post(
+            f"/api/interviews/{interview['id']}/transcription-events",
+            json={"kind": "live_transcription_completed"},
+        )
+        invalid = transcription_client.post(
+            f"/api/interviews/{interview['id']}/transcription-events",
+            json={"kind": "arbitrary_event"},
+        )
+        transcript_field = transcription_client.post(
+            f"/api/interviews/{interview['id']}/transcription-events",
+            json={
+                "kind": "live_transcription_failed",
+                "transcript": "private candidate transcript",
+            },
+        )
+        audio_field = transcription_client.post(
+            f"/api/interviews/{interview['id']}/transcription-events",
+            json={
+                "kind": "double_transcription_failure",
+                "audio": "private-candidate-audio",
+            },
+        )
+
+    assert failure.status_code == 502
+    assert failure.headers["X-Error-ID"] == failure.json()["error"]["id"]
+    assert failure.json()["error"]["code"] == "http_error"
+    assert "provider response body" not in failure.text
+    assert unexpected_failure.status_code == 502
+    assert (
+        unexpected_failure.headers["X-Error-ID"]
+        == unexpected_failure.json()["error"]["id"]
+    )
+    assert "provider response body" not in unexpected_failure.text
+    assert allowed.status_code == 204
+    assert invalid.status_code == transcript_field.status_code == 422
+    assert audio_field.status_code == 422
+    assert "private-candidate-audio" not in caplog.text
+    assert "private candidate transcript" not in caplog.text
+    assert "provider response body" not in caplog.text
+    with sqlite3.connect(database_path) as connection:
+        events = connection.execute(
+            "SELECT kind, quantity FROM usage_events WHERE session_id = ?",
+            (interview["id"],),
+        ).fetchall()
+    assert events.count(("live_transcription_completed", 1)) == 1
+    assert not {
+        "arbitrary_event",
+        "live_transcription_failed",
+        "double_transcription_failure",
+    } & {kind for kind, _quantity in events}
+
+
+def test_voice_evaluation_waits_for_transcription_finalization(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    transcription_settings = Settings(
+        _env_file=None,
+        app_env="test",
+        auth_mode="local",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'pending-finalization.db'}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
+        azure_openai_text_deployment="evaluation-deployment",
+    )
+    evaluation_calls = 0
+
+    async def forbidden_evaluation(**_kwargs: object) -> EvaluationReport:
+        nonlocal evaluation_calls
+        evaluation_calls += 1
+        raise AssertionError("pending transcription must stop before evaluation")
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.services.evaluation_jobs.evaluate_transcript", forbidden_evaluation
+    )
+    with TestClient(create_app(transcription_settings)) as transcription_client:
+        interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, interview["id"], input_mode="voice"
+        )
+        saved = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns:batch",
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "pending-final",
+                        "speaker": "user",
+                        "transcript": "The live transcript is acknowledged.",
+                        "delivery_status": "acknowledged",
+                    }
+                ]
+            },
+        )
+        completed = transcription_client.post(
+            f"/api/interviews/{interview['id']}/complete"
+        )
+        runtime = transcription_client.get(f"/api/interviews/{interview['id']}/runtime")
+
+    assert saved.status_code == completed.status_code == 200
+    assert saved.json()["turns"][0]["delivery_status"] == "acknowledged"
+    assert saved.json()["turns"][0]["transcription_finalized_at"] is None
+    assert runtime.json()["status"] == "FAILED_RECOVERABLE"
+    assert evaluation_calls == 0
+
+
 def test_m3_text_realtime_flow_is_private_long_and_idempotent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -700,9 +1302,9 @@ def test_m3_text_realtime_flow_is_private_long_and_idempotent(
         assert len(pending.json()["turns"]) == 1
         legacy_turn = pending.json()["turns"][0]
         assert legacy_turn["delivery_status"] == "pending"
-        assert legacy_turn["transcription_source"] == "legacy"
+        assert legacy_turn["transcription_source"] == "typed"
         assert legacy_turn["transcription_model"] is None
-        assert legacy_turn["transcription_finalized_at"] is None
+        assert legacy_turn["transcription_finalized_at"] is not None
 
         pending_payload["items"][0]["delivery_status"] = "acknowledged"
         acknowledged = realtime_client.post(

@@ -111,8 +111,9 @@ async def test_voice_secret_configures_vad_and_input_transcription() -> None:
 
 
 @pytest.mark.asyncio
-async def test_voice_secret_requires_a_configured_live_transcription_deployment(
-) -> None:
+async def test_voice_secret_requires_a_configured_live_transcription_deployment() -> (
+    None
+):
     settings = Settings(
         _env_file=None,
         azure_openai_endpoint="https://example.services.ai.azure.com",
