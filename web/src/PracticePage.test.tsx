@@ -627,6 +627,22 @@ describe("Dual transcription preflight", () => {
     ).toBeDisabled();
   });
 
+  it("describes transient in-memory audio processing instead of Realtime-only delivery", async () => {
+    installFetch();
+    installMedia();
+
+    renderPage({});
+
+    expect(
+      await screen.findByText(
+        /Audio is processed in memory for live and final transcription, sent to the configured Azure provider, and not retained by this app/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/goes directly to Azure Realtime/i),
+    ).not.toBeInTheDocument();
+  });
+
   it("refuses microphone capture when no allowlisted recorder MIME type exists", async () => {
     installFetch();
     const { getUserMedia } = installMedia();

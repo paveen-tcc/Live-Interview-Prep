@@ -364,6 +364,14 @@ describe("session dashboard", () => {
     expect(
       screen.getByText(/Provider cost telemetry is not available/),
     ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /Voice audio is held only in browser and API memory while the configured Azure provider transcribes it/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/never written to disk and is not retained/),
+    ).toBeInTheDocument();
 
     await userEvent.click(
       screen.getByRole("button", { name: "Delete my account" }),

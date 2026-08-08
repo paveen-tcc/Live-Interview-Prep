@@ -135,20 +135,27 @@ export function PrivacyPage({ onBack }: PrivacyPageProps) {
             sameRetention ? (
               <p>
                 Transcripts and optional delivery metrics are retained for{" "}
-                {usage.transcript_retention_days} days. Raw résumé files and raw
-                audio are not retained.
+                {usage.transcript_retention_days} days. Raw résumé files are not
+                retained.
               </p>
             ) : (
               <p>
                 Transcripts are retained for {usage.transcript_retention_days}{" "}
                 days; optional delivery metrics for{" "}
                 {usage.delivery_metrics_retention_days} days. Raw résumé files
-                and raw audio are not retained.
+                are not retained.
               </p>
             )
           ) : (
             <p>Loading the active retention policy…</p>
           )}
+          <p>
+            Voice audio is held only in browser and API memory while the
+            configured Azure provider transcribes it, once live during the
+            interview and once for the higher-accuracy final transcript. It is
+            never written to disk and is not retained by this application. Only
+            the resulting text is stored.
+          </p>
         </div>
         <div className="privacy-policy__danger">
           <div>

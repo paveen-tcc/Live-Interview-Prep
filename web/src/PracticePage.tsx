@@ -925,8 +925,9 @@ export function PracticePage({
                         Allow microphone access for this interview
                       </strong>
                       <small>
-                        Audio goes directly to Azure Realtime and is not stored
-                        by this app.
+                        Audio is processed in memory for live and final
+                        transcription, sent to the configured Azure provider,
+                        and not retained by this app.
                       </small>
                     </span>
                   </label>

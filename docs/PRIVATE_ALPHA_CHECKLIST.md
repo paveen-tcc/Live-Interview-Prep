@@ -17,6 +17,35 @@ The upload controls follow OWASP's defense-in-depth guidance: allowlisted CV for
 
 Operational events intentionally exclude résumé/transcript contents, credentials, and ephemeral secrets. This follows OWASP's recommendation to support security/operational investigation while excluding sensitive data. See <https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html>.
 
+## Dual-transcription degradation test
+
+Run this before a pilot, using non-sensitive synthetic speech only. Restart the
+API after each `.env` change so the capability flags are re-read.
+
+- [ ] **Final deployment disabled.** Clear
+      `AZURE_OPENAI_FINAL_TRANSCRIPTION_DEPLOYMENT`. The voice preflight refuses
+      to start and names the final transcription deployment.
+- [ ] **Live deployment disabled.** Restore final, clear
+      `AZURE_OPENAI_REALTIME_TRANSCRIPTION_MODEL`. The preflight refuses to start
+      and names the live transcription deployment.
+- [ ] **Both disabled.** Clear both. The preflight names both and
+      `Start interview` stays disabled.
+- [ ] **Final failing mid-interview.** With both configured, start an interview,
+      then make final transcription fail (point the deployment name at a
+      nonexistent deployment). The interview stays connected, shows the
+      nonblocking "Using live transcript" status, and the turn keeps its live
+      text with a `live_transcription_fallback` usage event.
+- [ ] **Both failing mid-interview.** Also break the live lane. The affected
+      answer pauses the microphone, shows the reconnect prompt, records a
+      `double_transcription_failure` event, and Reconnect recovers the retained
+      answer once a deployment is restored.
+- [ ] **Completion is blocked while unresolved.** With an answer in the paused
+      state, press Stop. The interview must refuse to complete and stay
+      reconnectable rather than producing an assistant-only report.
+- [ ] Confirm throughout that no audio file appears on the API host and that
+      logs contain request IDs, status codes, and latency but no transcript text
+      or audio bytes.
+
 ## Gates that cannot be closed by local automation
 
 - [ ] No unresolved critical finding after an independent security/privacy review

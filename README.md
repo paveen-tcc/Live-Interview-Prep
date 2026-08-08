@@ -79,7 +79,6 @@ to `.env`:
 ```text
 AZURE_OPENAI_REALTIME_DEPLOYMENT=gpt-realtime-2.1
 AZURE_OPENAI_REALTIME_VOICE=alloy
-AZURE_OPENAI_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 ENABLE_TEXT_DEV_MODE=true
 ```
 
@@ -89,6 +88,80 @@ production. In text mode the page creates no camera or microphone input track;
 Azure still returns the interviewer's spoken audio. Typed answers accept up to
 20,000 Unicode characters by default and are rejected explicitly above that
 limit rather than truncated.
+
+### Configure dual voice transcription
+
+Voice interviews transcribe each answer twice: live during the interview so the
+candidate sees text immediately, and again after the answer ends with a
+higher-accuracy model whose text replaces the live text. Both lanes are
+required — voice preflight refuses to start when either is unconfigured, and
+names the missing one.
+
+```text
+AZURE_OPENAI_REALTIME_TRANSCRIPTION_MODEL=gpt-realtime-whisper
+AZURE_OPENAI_FINAL_TRANSCRIPTION_DEPLOYMENT=gpt-4o-transcribe
+AZURE_OPENAI_TRANSCRIPTION_LANGUAGE=en
+AZURE_OPENAI_TRANSCRIPTION_DELAY=low
+AZURE_OPENAI_TRANSCRIPTION_API_VERSION=2024-06-01
+```
+
+These two values must be your **Azure deployment names, not model names**. They
+are identical only when the deployment was created with its model's name. A
+deployment named `whisper-prod` must be written as `whisper-prod` here; a
+model-name value that does not exist as a deployment fails at request time with
+`transcription_deployment_missing` rather than at startup.
+
+Final transcription calls the deployment-scoped route
+`/openai/deployments/<deployment>/audio/transcriptions`, selected by
+`AZURE_OPENAI_TRANSCRIPTION_API_VERSION`. Azure AI Foundry resources answer
+`DeploymentNotFound` on the unified `/openai/v1/audio/transcriptions` surface
+even when the deployment exists, so do not switch to it without verifying
+against the target resource first.
+
+`AZURE_OPENAI_TRANSCRIPTION_LANGUAGE` biases both lanes toward one language.
+`AZURE_OPENAI_TRANSCRIPTION_DELAY` trades live latency against live accuracy;
+it does not affect the final transcript. Timeout and upload size are tunable
+with `AZURE_OPENAI_FINAL_TRANSCRIPTION_TIMEOUT_SECONDS` (default 30) and
+`AZURE_OPENAI_FINAL_TRANSCRIPTION_MAX_BYTES` (default 25 MB).
+
+Answer audio is buffered in browser memory and streamed through the API to
+Azure without ever being written to disk on either side. See
+[docs/RETENTION_AND_DELETION.md](docs/RETENTION_AND_DELETION.md) for the exact
+lifecycle and release points.
+
+Transcription is not infallible. When the final lane fails the interview
+continues on the live transcript and shows a nonblocking status; when both lanes
+fail for one answer the microphone pauses and the candidate must press
+**Reconnect**, which retries the retained answer.
+
+Running against a database created before this feature requires the new
+transcript-provenance columns. The head revision is `20260808_0008`.
+
+For an Alembic-managed database:
+
+```bash
+alembic upgrade head
+```
+
+For a database first created with `AUTO_CREATE_SCHEMA=true`, `upgrade head`
+fails with "table users already exists": the tables exist but no
+`alembic_version` row records that. Tell Alembic what the schema already matches
+before upgrading:
+
+```bash
+alembic stamp 20260807_0007
+alembic upgrade head
+```
+
+Only stamp a database whose schema really is at `20260807_0007`; stamping
+records a revision without running it. Revision `20260808_0008` adds three
+nullable-or-defaulted columns to `interview_turns` and backfills existing rows
+with `transcription_source="legacy"`, so no turn, session, or report is lost.
+Back the file up first anyway:
+
+```bash
+cp data/interview_coach.db data/interview_coach.db.bak
+```
 
 ### Use Neon PostgreSQL locally
 
@@ -195,6 +268,9 @@ deferred; the retained deployment contract is documented in
 8. Stop the interview and wait for the evidence-backed report. Expand one transcript excerpt and confirm its quote matches what was submitted.
 9. In text mode, confirm **Speaking delivery** is marked unavailable rather than scored.
 10. Open **Privacy & usage** and verify the active quota/retention policy. Test session deletion only with a disposable session.
+11. In voice mode, speak one non-sensitive answer such as "I built a FastAPI service backed by PostgreSQL". The candidate turn must appear once, first as live text and then replaced by the final transcript, ending with `transcription_source="final_model"`.
 
 Voice-mode completion on current Chrome, Safari, and Edge, plus the documented
 latency and impaired-network measurements, remain manual M3 release checks.
+The dual-transcription degradation matrix in the [private-alpha exit
+checklist](docs/PRIVATE_ALPHA_CHECKLIST.md) is also a manual check.
