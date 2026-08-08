@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from domain.interview import DeliveryStatus, InputMode, InterviewType, Speaker
+
+ClientTurnId = Annotated[
+    str,
+    Field(min_length=3, max_length=96, pattern=r"^[A-Za-z0-9_-]+$"),
+]
 
 
 class RealtimeClientSecretRequest(BaseModel):
@@ -29,9 +34,7 @@ class ConnectionStateRequest(BaseModel):
 
 
 class InterviewTurnInput(BaseModel):
-    client_turn_id: str = Field(
-        min_length=3, max_length=96, pattern=r"^[A-Za-z0-9_-]+$"
-    )
+    client_turn_id: ClientTurnId
     speaker: Speaker
     # The user-answer limit is runtime configuration and is enforced by the
     # route. Keeping it out of the static schema prevents the API from

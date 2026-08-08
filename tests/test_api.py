@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import inspect
 import io
 import json
 import socket
 import sqlite3
 import ssl
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -17,14 +21,17 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+from sqlalchemy.ext.asyncio import AsyncSession
 
 import api.database as database
+import api.routes.realtime as realtime_routes
 from api.config import PROJECT_ROOT, Settings, get_settings
 from api.database import (
     database_connect_args,
     normalized_database_url,
 )
 from api.main import create_app
+from api.models import InterviewTurn
 from api.services.realtime import RealtimeClientSecret
 from api.services.transcription import FinalTranscription, TranscriptionServiceError
 from domain.evaluation import (
@@ -275,6 +282,22 @@ async def _fake_realtime_secret(**_kwargs: object) -> RealtimeClientSecret:
         value="ek_temporary",
         expires_at=2_000_000_000,
         calls_url="https://example.invalid/openai/v1/realtime/calls",
+    )
+
+
+def _dual_transcription_settings(database_path: Path) -> Settings:
+    return Settings(
+        _env_file=None,
+        app_env="test",
+        auth_mode="local",
+        database_url=f"sqlite+aiosqlite:///{database_path}",
+        auto_create_schema=True,
+        web_dist_dir=database_path.parent / "missing-dist",
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
+        azure_openai_final_transcription_deployment="final-stt-deployment",
     )
 
 
@@ -653,6 +676,33 @@ def test_capabilities_expose_only_safe_dual_transcription_configuration(
     assert "server-key" not in serialized_body
 
 
+def test_final_transcription_route_defers_multipart_to_bounded_request_parser() -> None:
+    signature = inspect.signature(realtime_routes.finalize_candidate_transcription)
+
+    assert "file" not in signature.parameters
+    assert all(
+        "UploadFile" not in str(parameter.annotation)
+        for parameter in signature.parameters.values()
+    )
+
+
+@pytest.mark.parametrize("client_turn_id", ["ab", "bad.id", "x" * 97])
+def test_turn_path_ids_share_the_batch_identifier_constraint(
+    client: TestClient, client_turn_id: str
+) -> None:
+    interview = _create_session(client)
+
+    transcribe = client.post(
+        f"/api/interviews/{interview['id']}/turns/{client_turn_id}:transcribe",
+        files={"file": ("answer.webm", b"audio", "audio/webm")},
+    )
+    accept = client.post(
+        f"/api/interviews/{interview['id']}/turns/{client_turn_id}:accept-live"
+    )
+
+    assert transcribe.status_code == accept.status_code == 422
+
+
 def test_final_transcription_upgrades_live_turn_once_and_late_live_is_noop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -844,8 +894,19 @@ def test_final_first_transcription_is_not_replaced_by_late_live_turn(
         _start_ready_interview(
             transcription_client, interview["id"], input_mode="voice"
         )
+
+        def spooling_forbidden(*_args: object, **_kwargs: object) -> object:
+            raise AssertionError("candidate audio must not use Starlette file spooling")
+
+        monkeypatch.setattr(
+            "starlette.formparsers.SpooledTemporaryFile", spooling_forbidden
+        )
         finalized = transcription_client.post(
             f"/api/interviews/{interview['id']}/turns/final-first:transcribe",
+            data={
+                "started_at": "2026-08-08T10:00:00Z",
+                "ended_at": "2026-08-08T10:00:03Z",
+            },
             files={"file": ("answer.ogg", b"audio", "audio/ogg")},
         )
         late_live = transcription_client.post(
@@ -862,6 +923,8 @@ def test_final_first_transcription_is_not_replaced_by_late_live_turn(
         )
 
     assert finalized.status_code == late_live.status_code == 200
+    assert finalized.json()["started_at"] == "2026-08-08T10:00:00Z"
+    assert finalized.json()["ended_at"] == "2026-08-08T10:00:03Z"
     assert len(late_live.json()["turns"]) == 1
     assert late_live.json()["turns"][0] == finalized.json()
 
@@ -1042,6 +1105,237 @@ def test_accept_live_finalizes_only_owned_live_candidate_turns(
     assert fallback_events.count(("live_transcription_fallback", 1)) == 1
 
 
+def test_concurrent_final_first_requests_converge_on_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "final-final-race.db"
+    settings = _dual_transcription_settings(database_path)
+    provider_barrier = threading.Barrier(2)
+    second_read_barrier = threading.Barrier(2)
+    provider_calls = 0
+
+    async def synchronized_transcription(**_kwargs: object) -> FinalTranscription:
+        nonlocal provider_calls
+        provider_calls += 1
+        await asyncio.to_thread(provider_barrier.wait, 10)
+        return FinalTranscription(
+            text="Both final requests converge here.",
+            deployment="final-stt-deployment",
+            elapsed_ms=10,
+            attempts=1,
+        )
+
+    original_turn_lookup = realtime_routes._turn_by_client_id
+
+    async def synchronized_turn_lookup(*args: object, **kwargs: object):
+        turn = await original_turn_lookup(*args, **kwargs)
+        if args[2] == "race-final" and provider_calls == 2 and turn is None:
+            await asyncio.to_thread(second_read_barrier.wait, 10)
+        return turn
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime.transcribe_candidate_audio", synchronized_transcription
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime._turn_by_client_id", synchronized_turn_lookup
+    )
+    with TestClient(
+        create_app(settings), raise_server_exceptions=False
+    ) as transcription_client:
+        interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, interview["id"], input_mode="voice"
+        )
+
+        def transcribe() -> object:
+            return transcription_client.post(
+                f"/api/interviews/{interview['id']}/turns/race-final:transcribe",
+                files={"file": ("answer.webm", b"audio", "audio/webm")},
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = [
+                future.result()
+                for future in [executor.submit(transcribe) for _ in range(2)]
+            ]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert responses[0].json()["id"] == responses[1].json()["id"]
+    with sqlite3.connect(database_path) as connection:
+        turn_count = connection.execute(
+            "SELECT COUNT(*) FROM interview_turns WHERE client_turn_id = 'race-final'"
+        ).fetchone()[0]
+        event_count = connection.execute(
+            "SELECT COUNT(*) FROM usage_events "
+            "WHERE kind = 'final_transcription_completed'"
+        ).fetchone()[0]
+    assert turn_count == event_count == 1
+
+
+def test_concurrent_live_and_final_inserts_converge_on_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "live-final-race.db"
+    settings = _dual_transcription_settings(database_path)
+    provider_started = threading.Event()
+    release_provider = threading.Event()
+    batch_waiting = threading.Event()
+    release_batch = threading.Event()
+
+    async def synchronized_transcription(**_kwargs: object) -> FinalTranscription:
+        provider_started.set()
+        assert await asyncio.to_thread(release_provider.wait, 10)
+        return FinalTranscription(
+            text="The final transcript wins the race.",
+            deployment="final-stt-deployment",
+            elapsed_ms=10,
+            attempts=1,
+        )
+
+    original_turn_lookup = realtime_routes._turn_by_client_id
+
+    async def release_batch_after_final_read(*args: object, **kwargs: object):
+        turn = await original_turn_lookup(*args, **kwargs)
+        if args[2] == "race-live-final" and release_provider.is_set() and turn is None:
+            release_batch.set()
+        return turn
+
+    original_commit = AsyncSession.commit
+
+    async def hold_live_insert_commit(session: AsyncSession) -> None:
+        if any(
+            isinstance(item, InterviewTurn)
+            and item.client_turn_id == "race-live-final"
+            and item.transcription_source == "realtime_live"
+            for item in session.new
+        ):
+            batch_waiting.set()
+            assert await asyncio.to_thread(release_batch.wait, 10)
+        await original_commit(session)
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime.transcribe_candidate_audio", synchronized_transcription
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime._turn_by_client_id", release_batch_after_final_read
+    )
+    with TestClient(
+        create_app(settings), raise_server_exceptions=False
+    ) as transcription_client:
+        interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, interview["id"], input_mode="voice"
+        )
+        monkeypatch.setattr(AsyncSession, "commit", hold_live_insert_commit)
+
+        def transcribe() -> object:
+            return transcription_client.post(
+                f"/api/interviews/{interview['id']}/turns/race-live-final:transcribe",
+                files={"file": ("answer.webm", b"audio", "audio/webm")},
+            )
+
+        def save_live() -> object:
+            return transcription_client.post(
+                f"/api/interviews/{interview['id']}/turns:batch",
+                json={
+                    "items": [
+                        {
+                            "client_turn_id": "race-live-final",
+                            "speaker": "user",
+                            "transcript": "The live transcript loses the race.",
+                        }
+                    ]
+                },
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            final_future = executor.submit(transcribe)
+            assert provider_started.wait(10)
+            live_future = executor.submit(save_live)
+            assert batch_waiting.wait(10)
+            release_provider.set()
+            responses = [final_future.result(), live_future.result()]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    with sqlite3.connect(database_path) as connection:
+        saved = connection.execute(
+            "SELECT transcript, transcription_source FROM interview_turns "
+            "WHERE client_turn_id = 'race-live-final'"
+        ).fetchall()
+    assert saved == [("The final transcript wins the race.", "final_model")]
+
+
+def test_concurrent_live_acceptance_writes_one_fallback_event_on_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "accept-accept-race.db"
+    settings = _dual_transcription_settings(database_path)
+    read_barrier = threading.Barrier(2)
+    original_turn_lookup = realtime_routes._turn_by_client_id
+
+    async def synchronized_turn_lookup(*args: object, **kwargs: object):
+        turn = await original_turn_lookup(*args, **kwargs)
+        if (
+            args[2] == "race-accept"
+            and turn is not None
+            and turn.transcription_finalized_at is None
+        ):
+            await asyncio.to_thread(read_barrier.wait, 10)
+        return turn
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime._turn_by_client_id", synchronized_turn_lookup
+    )
+    with TestClient(
+        create_app(settings), raise_server_exceptions=False
+    ) as transcription_client:
+        interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, interview["id"], input_mode="voice"
+        )
+        saved = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns:batch",
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "race-accept",
+                        "speaker": "user",
+                        "transcript": "Accept this live transcript once.",
+                    }
+                ]
+            },
+        )
+        assert saved.status_code == 200
+
+        def accept() -> object:
+            return transcription_client.post(
+                f"/api/interviews/{interview['id']}/turns/race-accept:accept-live"
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = [
+                future.result()
+                for future in [executor.submit(accept) for _ in range(2)]
+            ]
+
+    assert [response.status_code for response in responses] == [200, 200]
+    with sqlite3.connect(database_path) as connection:
+        event_count = connection.execute(
+            "SELECT COUNT(*) FROM usage_events "
+            "WHERE kind = 'live_transcription_fallback'"
+        ).fetchone()[0]
+    assert event_count == 1
+
+
 def test_transcription_errors_and_telemetry_are_content_free(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1209,6 +1503,98 @@ def test_voice_evaluation_waits_for_transcription_finalization(
     assert saved.json()["turns"][0]["transcription_finalized_at"] is None
     assert runtime.json()["status"] == "FAILED_RECOVERABLE"
     assert evaluation_calls == 0
+
+
+def test_assistant_only_transcript_never_reaches_evaluator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _dual_transcription_settings(tmp_path / "assistant-only.db")
+    evaluation_calls = 0
+
+    async def forbidden_evaluation(**_kwargs: object) -> EvaluationReport:
+        nonlocal evaluation_calls
+        evaluation_calls += 1
+        raise AssertionError("assistant-only transcript must not reach evaluation")
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.services.evaluation_jobs.evaluate_transcript", forbidden_evaluation
+    )
+    with TestClient(create_app(settings)) as evaluation_client:
+        interview = _ready_session(evaluation_client)
+        _start_ready_interview(evaluation_client, interview["id"], input_mode="voice")
+        saved = evaluation_client.post(
+            f"/api/interviews/{interview['id']}/turns:batch",
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "assistant-only",
+                        "speaker": "assistant",
+                        "transcript": "Tell me about an API you designed.",
+                    }
+                ]
+            },
+        )
+        completed = evaluation_client.post(
+            f"/api/interviews/{interview['id']}/complete"
+        )
+        runtime = evaluation_client.get(f"/api/interviews/{interview['id']}/runtime")
+
+    assert saved.status_code == completed.status_code == 200
+    assert runtime.json()["status"] == "FAILED_RECOVERABLE"
+    assert evaluation_calls == 0
+
+
+def test_legacy_voice_candidate_turn_remains_evaluable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "legacy-voice-evaluation.db"
+    settings = _dual_transcription_settings(database_path)
+    evaluation_calls = 0
+
+    async def observed_evaluation(**_kwargs: object) -> EvaluationReport:
+        nonlocal evaluation_calls
+        evaluation_calls += 1
+        raise AssertionError("legacy compatibility reached the evaluator")
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.services.evaluation_jobs.evaluate_transcript", observed_evaluation
+    )
+    with TestClient(create_app(settings)) as evaluation_client:
+        interview = _ready_session(evaluation_client)
+        _start_ready_interview(evaluation_client, interview["id"], input_mode="voice")
+        saved = evaluation_client.post(
+            f"/api/interviews/{interview['id']}/turns:batch",
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "legacy-candidate",
+                        "speaker": "user",
+                        "transcript": "This predates dual transcription.",
+                    }
+                ]
+            },
+        )
+        assert saved.status_code == 200
+        with sqlite3.connect(database_path) as connection:
+            connection.execute(
+                "UPDATE interview_turns SET transcription_source = 'legacy', "
+                "transcription_model = NULL, transcription_finalized_at = NULL "
+                "WHERE session_id = ? AND client_turn_id = 'legacy-candidate'",
+                (interview["id"],),
+            )
+            connection.commit()
+        completed = evaluation_client.post(
+            f"/api/interviews/{interview['id']}/complete"
+        )
+
+    assert completed.status_code == 200
+    assert evaluation_calls == 1
 
 
 def test_m3_text_realtime_flow_is_private_long_and_idempotent(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import UTC, datetime, timedelta
@@ -11,13 +12,12 @@ from fastapi import (
     APIRouter,
     BackgroundTasks,
     Depends,
-    File,
     HTTPException,
     Request,
     Response,
-    UploadFile,
 )
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from domain.interview import (
@@ -45,6 +45,7 @@ from ..models import (
     User,
 )
 from ..realtime_schemas import (
+    ClientTurnId,
     ConnectionStateRequest,
     InterviewRuntimeResponse,
     InterviewTurnBatchRequest,
@@ -53,9 +54,15 @@ from ..realtime_schemas import (
     RealtimeClientSecretResponse,
     TranscriptionEventRequest,
 )
+from ..services.audio_multipart import (
+    AudioMultipartError,
+    CandidateAudioMultipart,
+    parse_candidate_audio_multipart,
+)
 from ..services.evaluation_jobs import run_evaluation_job
 from ..services.realtime import RealtimeServiceError, create_realtime_client_secret
 from ..services.transcription import (
+    FinalTranscription,
     TranscriptionServiceError,
     build_transcription_prompt,
     transcribe_candidate_audio,
@@ -178,6 +185,19 @@ def _latency_bucket(elapsed_ms: int) -> str:
     if elapsed_ms < 10_000:
         return "3s_to_10s"
     return "over_10s"
+
+
+def _retryable_turn_write(error: Exception) -> bool:
+    if isinstance(error, IntegrityError):
+        return True
+    if not isinstance(error, OperationalError):
+        return False
+    message = str(error.orig).lower()
+    return "database is locked" in message or "database table is locked" in message
+
+
+async def _retry_turn_write(attempt: int) -> None:
+    await asyncio.sleep(0.01 * (2**attempt))
 
 
 def _runtime_response(
@@ -473,7 +493,42 @@ async def upsert_interview_turns(
     database: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> InterviewRuntimeResponse:
     settings: Settings = request.app.state.settings
-    interview = await _owned_interview(database, user, interview_id, for_update=True)
+    user_id = user.id
+    for attempt in range(3):
+        try:
+            interview = await _upsert_interview_turns_once(
+                database=database,
+                user_id=user_id,
+                interview_id=interview_id,
+                payload=payload,
+                settings=settings,
+            )
+            await database.commit()
+            return _runtime_response(
+                interview, await _turns(database, interview.id), settings
+            )
+        except (IntegrityError, OperationalError) as exc:
+            await database.rollback()
+            if not _retryable_turn_write(exc) or attempt == 2:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Transcript turns changed concurrently. Retry the request.",
+                ) from exc
+            await _retry_turn_write(attempt)
+    raise AssertionError("turn persistence retry loop did not return or raise")
+
+
+async def _upsert_interview_turns_once(
+    *,
+    database: AsyncSession,
+    user_id: str,
+    interview_id: str,
+    payload: InterviewTurnBatchRequest,
+    settings: Settings,
+) -> InterviewSession:
+    interview = await _owned_interview_for_user_id(
+        database, user_id, interview_id, for_update=True
+    )
     expired = await _finalize_if_expired(interview, database)
     if expired:
         raise HTTPException(status_code=409, detail="The interview timer has expired.")
@@ -569,8 +624,7 @@ async def upsert_interview_turns(
             )
         )
         next_sequence += 1
-    await database.commit()
-    return _runtime_response(interview, await _turns(database, interview.id), settings)
+    return interview
 
 
 @router.post(
@@ -579,178 +633,215 @@ async def upsert_interview_turns(
 )
 async def finalize_candidate_transcription(
     interview_id: str,
-    client_turn_id: str,
+    client_turn_id: ClientTurnId,
     request: Request,
-    file: Annotated[UploadFile, File()],
     user: Annotated[User, Depends(get_current_user)],
     database: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> InterviewTurnResponse:
     settings: Settings = request.app.state.settings
     started = time.perf_counter()
     user_id = user.id
+    interview = await _owned_interview_for_user_id(
+        database, user_id, interview_id, for_update=True
+    )
+    await _finalize_if_expired(interview, database)
+    existing = await _turn_by_client_id(
+        database, interview.id, client_turn_id, for_update=True
+    )
+    if existing is not None and existing.transcription_source == "final_model":
+        return _turn_response(existing)
+    if interview.input_mode != "voice":
+        raise HTTPException(
+            status_code=409,
+            detail="Final audio transcription is available only in voice mode.",
+        )
+    if existing is not None and (
+        existing.speaker != "user" or existing.transcription_source != "realtime_live"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Only a live candidate turn can be finalized from audio.",
+        )
+    if interview.ended_at is not None and existing is None:
+        raise HTTPException(
+            status_code=409,
+            detail="New transcript turns are not accepted after the timer ends.",
+        )
+    if existing is None and interview.status not in ACTIVE_INTERVIEW_STATES | {
+        "TRANSCRIPT_FINALIZING"
+    }:
+        raise HTTPException(status_code=409, detail="The interview is not active.")
+
+    content_length_header = request.headers.get("content-length")
     try:
-        interview = await _owned_interview_for_user_id(
-            database, user_id, interview_id, for_update=True
+        content_length = (
+            int(content_length_header) if content_length_header is not None else None
         )
-        await _finalize_if_expired(interview, database)
-        existing = await _turn_by_client_id(
-            database, interview.id, client_turn_id, for_update=True
+    except ValueError:
+        content_length = None
+    try:
+        upload = await parse_candidate_audio_multipart(
+            chunks=request.stream(),
+            content_type=request.headers.get("content-type", ""),
+            content_length=content_length,
+            max_audio_bytes=settings.azure_openai_final_transcription_max_bytes,
         )
-        if existing is not None and existing.transcription_source == "final_model":
-            return _turn_response(existing)
-        if interview.input_mode != "voice":
-            raise HTTPException(
-                status_code=409,
-                detail="Final audio transcription is available only in voice mode.",
-            )
-        if existing is not None and (
-            existing.speaker != "user"
-            or existing.transcription_source != "realtime_live"
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="Only a live candidate turn can be finalized from audio.",
-            )
-        if interview.ended_at is not None and existing is None:
-            raise HTTPException(
-                status_code=409,
-                detail="New transcript turns are not accepted after the timer ends.",
-            )
-        if existing is None and interview.status not in ACTIVE_INTERVIEW_STATES | {
-            "TRANSCRIPT_FINALIZING"
-        }:
-            raise HTTPException(status_code=409, detail="The interview is not active.")
+    except AudioMultipartError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    if upload.media_type not in _ALLOWED_TRANSCRIPTION_MEDIA_TYPES:
+        raise HTTPException(
+            status_code=415,
+            detail="Candidate audio must be WebM, MP4, or Ogg.",
+        )
+    prompt = build_transcription_prompt(interview.setup_snapshot or {})
+    await database.rollback()
 
-        media_type = (file.content_type or "").split(";", 1)[0].strip().lower()
-        if media_type not in _ALLOWED_TRANSCRIPTION_MEDIA_TYPES:
-            raise HTTPException(
-                status_code=415,
-                detail="Candidate audio must be WebM, MP4, or Ogg.",
-            )
-        audio = await file.read(settings.azure_openai_final_transcription_max_bytes + 1)
-        if not audio:
-            raise HTTPException(
-                status_code=422, detail="Candidate audio must not be empty."
-            )
-        if len(audio) > settings.azure_openai_final_transcription_max_bytes:
-            raise HTTPException(
-                status_code=413,
-                detail="Candidate audio exceeds the configured size limit.",
-            )
-        prompt = build_transcription_prompt(interview.setup_snapshot or {})
-        await database.rollback()
-
-        try:
-            result = await transcribe_candidate_audio(
-                settings=settings,
-                audio=audio,
-                media_type=media_type,
-                filename=file.filename or f"{client_turn_id}.webm",
-                prompt=prompt,
-            )
-        except TranscriptionServiceError as exc:
-            elapsed_ms = int((time.perf_counter() - started) * 1_000)
-            logger.warning(
-                "final_transcription_failed",
-                extra={
-                    "request_id": getattr(request.state, "request_id", None),
-                    "interview_id": interview_id,
-                    "safe_error_code": exc.code,
-                    "attempt_count": exc.attempts,
-                    "latency_bucket": _latency_bucket(elapsed_ms),
-                },
-            )
-            raise HTTPException(
-                status_code=exc.status_code,
-                detail=str(exc),
-            ) from exc
-        except Exception as exc:
-            elapsed_ms = int((time.perf_counter() - started) * 1_000)
-            logger.warning(
-                "final_transcription_failed",
-                extra={
-                    "request_id": getattr(request.state, "request_id", None),
-                    "interview_id": interview_id,
-                    "safe_error_code": "transcription_unexpected",
-                    "attempt_count": 1,
-                    "latency_bucket": _latency_bucket(elapsed_ms),
-                },
-            )
-            raise HTTPException(
-                status_code=502,
-                detail="Final transcription failed safely. Try again.",
-            ) from exc
-
-        interview = await _owned_interview_for_user_id(
-            database, user_id, interview_id, for_update=True
+    try:
+        result = await transcribe_candidate_audio(
+            settings=settings,
+            audio=upload.audio,
+            media_type=upload.media_type,
+            filename=upload.filename or f"{client_turn_id}.webm",
+            prompt=prompt,
         )
-        await _finalize_if_expired(interview, database)
-        turn = await _turn_by_client_id(
-            database, interview.id, client_turn_id, for_update=True
-        )
-        if turn is not None and turn.transcription_source == "final_model":
-            return _turn_response(turn)
-        if turn is not None and (
-            turn.speaker != "user" or turn.transcription_source != "realtime_live"
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail="Only a live candidate turn can be finalized from audio.",
-            )
-        if interview.ended_at is not None and turn is None:
-            raise HTTPException(
-                status_code=409,
-                detail="New transcript turns are not accepted after the timer ends.",
-            )
-        now = datetime.now(UTC)
-        if turn is None:
-            maximum_sequence = await database.scalar(
-                select(func.max(InterviewTurn.sequence)).where(
-                    InterviewTurn.session_id == interview.id
-                )
-            )
-            turn = InterviewTurn(
-                session_id=interview.id,
-                client_turn_id=client_turn_id,
-                sequence=(maximum_sequence or 0) + 1,
-                speaker="user",
-                transcript=result.text,
-                delivery_status="acknowledged",
-                transcription_source="final_model",
-                transcription_model=result.deployment,
-                transcription_finalized_at=now,
-                started_at=now,
-            )
-            database.add(turn)
-        else:
-            turn.transcript = result.text
-            turn.delivery_status = "acknowledged"
-            turn.transcription_source = "final_model"
-            turn.transcription_model = result.deployment
-            turn.transcription_finalized_at = now
-        database.add(
-            UsageEvent(
-                user_id=user_id,
-                session_id=interview.id,
-                kind="final_transcription_completed",
-                quantity=1,
-                estimated_cost_microusd=0,
-            )
-        )
-        await database.commit()
-        logger.info(
-            "final_transcription_completed",
+    except TranscriptionServiceError as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1_000)
+        logger.warning(
+            "final_transcription_failed",
             extra={
                 "request_id": getattr(request.state, "request_id", None),
-                "interview_id": interview.id,
-                "safe_error_code": None,
-                "attempt_count": result.attempts,
-                "latency_bucket": _latency_bucket(result.elapsed_ms),
+                "interview_id": interview_id,
+                "safe_error_code": exc.code,
+                "attempt_count": exc.attempts,
+                "latency_bucket": _latency_bucket(elapsed_ms),
             },
         )
-        return _turn_response(turn)
-    finally:
-        await file.close()
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=str(exc),
+        ) from exc
+    except Exception as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1_000)
+        logger.warning(
+            "final_transcription_failed",
+            extra={
+                "request_id": getattr(request.state, "request_id", None),
+                "interview_id": interview_id,
+                "safe_error_code": "transcription_unexpected",
+                "attempt_count": 1,
+                "latency_bucket": _latency_bucket(elapsed_ms),
+            },
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Final transcription failed safely. Try again.",
+        ) from exc
+
+    for attempt in range(3):
+        try:
+            turn, wrote_final = await _persist_final_transcription_once(
+                database=database,
+                user_id=user_id,
+                interview_id=interview_id,
+                client_turn_id=client_turn_id,
+                upload=upload,
+                result=result,
+            )
+            await database.commit()
+            if wrote_final:
+                logger.info(
+                    "final_transcription_completed",
+                    extra={
+                        "request_id": getattr(request.state, "request_id", None),
+                        "interview_id": interview_id,
+                        "safe_error_code": None,
+                        "attempt_count": result.attempts,
+                        "latency_bucket": _latency_bucket(result.elapsed_ms),
+                    },
+                )
+            return _turn_response(turn)
+        except (IntegrityError, OperationalError) as exc:
+            await database.rollback()
+            if not _retryable_turn_write(exc) or attempt == 2:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Candidate transcription changed concurrently. Retry.",
+                ) from exc
+            await _retry_turn_write(attempt)
+    raise AssertionError("final transcription retry loop did not return or raise")
+
+
+async def _persist_final_transcription_once(
+    *,
+    database: AsyncSession,
+    user_id: str,
+    interview_id: str,
+    client_turn_id: str,
+    upload: CandidateAudioMultipart,
+    result: FinalTranscription,
+) -> tuple[InterviewTurn, bool]:
+    interview = await _owned_interview_for_user_id(
+        database, user_id, interview_id, for_update=True
+    )
+    await _finalize_if_expired(interview, database)
+    turn = await _turn_by_client_id(
+        database, interview.id, client_turn_id, for_update=True
+    )
+    if turn is not None and turn.transcription_source == "final_model":
+        return turn, False
+    if turn is not None and (
+        turn.speaker != "user" or turn.transcription_source != "realtime_live"
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="Only a live candidate turn can be finalized from audio.",
+        )
+    if interview.ended_at is not None and turn is None:
+        raise HTTPException(
+            status_code=409,
+            detail="New transcript turns are not accepted after the timer ends.",
+        )
+    now = datetime.now(UTC)
+    if turn is None:
+        maximum_sequence = await database.scalar(
+            select(func.max(InterviewTurn.sequence)).where(
+                InterviewTurn.session_id == interview.id
+            )
+        )
+        turn = InterviewTurn(
+            session_id=interview.id,
+            client_turn_id=client_turn_id,
+            sequence=(maximum_sequence or 0) + 1,
+            speaker="user",
+            transcript=result.text,
+            delivery_status="acknowledged",
+            transcription_source="final_model",
+            transcription_model=result.deployment,
+            transcription_finalized_at=now,
+            started_at=upload.started_at or now,
+            ended_at=upload.ended_at,
+        )
+        database.add(turn)
+    else:
+        turn.transcript = result.text
+        turn.delivery_status = "acknowledged"
+        turn.transcription_source = "final_model"
+        turn.transcription_model = result.deployment
+        turn.transcription_finalized_at = now
+        if upload.started_at is not None:
+            turn.started_at = upload.started_at
+        if upload.ended_at is not None:
+            turn.ended_at = upload.ended_at
+    database.add(
+        UsageEvent(
+            user_id=user_id,
+            session_id=interview.id,
+            kind="final_transcription_completed",
+            quantity=1,
+            estimated_cost_microusd=0,
+        )
+    )
+    return turn, True
 
 
 @router.post(
@@ -759,11 +850,14 @@ async def finalize_candidate_transcription(
 )
 async def accept_live_candidate_transcription(
     interview_id: str,
-    client_turn_id: str,
+    client_turn_id: ClientTurnId,
     user: Annotated[User, Depends(get_current_user)],
     database: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> InterviewTurnResponse:
-    interview = await _owned_interview(database, user, interview_id, for_update=True)
+    user_id = user.id
+    interview = await _owned_interview_for_user_id(
+        database, user_id, interview_id, for_update=True
+    )
     await _finalize_if_expired(interview, database)
     turn = await _turn_by_client_id(
         database, interview.id, client_turn_id, for_update=True
@@ -775,19 +869,54 @@ async def accept_live_candidate_transcription(
             status_code=409,
             detail="Only a live candidate transcript can be accepted as fallback.",
         )
-    if turn.transcription_finalized_at is None:
-        turn.transcription_finalized_at = datetime.now(UTC)
-        database.add(
-            UsageEvent(
-                user_id=user.id,
-                session_id=interview.id,
-                kind="live_transcription_fallback",
-                quantity=1,
-                estimated_cost_microusd=0,
+    await database.rollback()
+    for attempt in range(3):
+        try:
+            accepted_at = datetime.now(UTC)
+            accepted = await database.execute(
+                update(InterviewTurn)
+                .where(
+                    InterviewTurn.session_id == interview_id,
+                    InterviewTurn.client_turn_id == client_turn_id,
+                    InterviewTurn.speaker == "user",
+                    InterviewTurn.transcription_source == "realtime_live",
+                    InterviewTurn.transcription_finalized_at.is_(None),
+                )
+                .values(transcription_finalized_at=accepted_at)
             )
+            if accepted.rowcount == 1:  # type: ignore[attr-defined]
+                database.add(
+                    UsageEvent(
+                        user_id=user_id,
+                        session_id=interview_id,
+                        kind="live_transcription_fallback",
+                        quantity=1,
+                        estimated_cost_microusd=0,
+                    )
+                )
+                await database.commit()
+            else:
+                await database.rollback()
+            break
+        except OperationalError as exc:
+            await database.rollback()
+            if not _retryable_turn_write(exc) or attempt == 2:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Live transcription changed concurrently. Retry.",
+                ) from exc
+            await _retry_turn_write(attempt)
+    else:
+        raise AssertionError("live acceptance retry loop did not finish")
+    saved = await _turn_by_client_id(database, interview_id, client_turn_id)
+    if saved is None:
+        raise HTTPException(status_code=404, detail="Candidate turn was not found.")
+    if saved.speaker != "user" or saved.transcription_source != "realtime_live":
+        raise HTTPException(
+            status_code=409,
+            detail="Only a live candidate transcript can be accepted as fallback.",
         )
-        await database.commit()
-    return _turn_response(turn)
+    return _turn_response(saved)
 
 
 @router.post("/{interview_id}/transcription-events", status_code=204)

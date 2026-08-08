@@ -212,6 +212,11 @@ async def _finalized_input(
         .order_by(InterviewTurn.sequence)
     )
     persisted_turns = list(result)
+    if not any(turn.speaker == "user" for turn in persisted_turns):
+        raise EvaluationServiceError(
+            "The finalized transcript does not contain a candidate answer.",
+            status_code=409,
+        )
     if interview.input_mode == "voice" and any(
         turn.speaker == "user"
         and turn.transcription_source != "legacy"
