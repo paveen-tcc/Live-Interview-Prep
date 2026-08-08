@@ -165,6 +165,38 @@ async def test_retries_timeout_before_returning_transcript() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enforces_configured_timeout_with_an_injected_client() -> None:
+    observed_timeout: dict[str, float | None] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed_timeout.update(request.extensions["timeout"])
+        return httpx.Response(200, json={"text": "Bounded transcript"})
+
+    settings = _settings().model_copy(
+        update={"azure_openai_final_transcription_timeout_seconds": 17.5}
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), timeout=None
+    ) as client:
+        result = await transcribe_candidate_audio(
+            settings=settings,
+            audio=b"audio",
+            media_type="audio/webm",
+            filename="answer.webm",
+            prompt="Role: Backend Engineer.",
+            client=client,
+        )
+
+    assert result.text == "Bounded transcript"
+    assert observed_timeout == {
+        "connect": 17.5,
+        "read": 17.5,
+        "write": 17.5,
+        "pool": 17.5,
+    }
+
+
+@pytest.mark.asyncio
 async def test_maps_non_retryable_provider_statuses_to_safe_categories(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

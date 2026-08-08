@@ -134,6 +134,7 @@ async def transcribe_candidate_audio(
                     headers=headers,
                     data=data,
                     files=files,
+                    timeout=settings.azure_openai_final_transcription_timeout_seconds,
                 )
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
                 if attempt < _MAX_ATTEMPTS:
