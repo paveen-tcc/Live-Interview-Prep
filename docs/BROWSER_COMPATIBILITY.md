@@ -7,6 +7,7 @@ Status: automated semantics and text-mode flows pass locally. Physical voice-dev
 | Dashboard, setup, scorecard, report | Pending current-stable smoke | Pending current-stable smoke | Pending current-stable smoke | React tests + local browser pass |
 | Developer text input; no media-input permission | Pending current-stable smoke | Pending current-stable smoke | Pending current-stable smoke | React/API/local browser pass |
 | Voice preflight and microphone permission | Pending physical test | Pending physical test | Pending physical test | Permission gating unit-tested |
+| Candidate utterance capture (`MediaRecorder`) | Prefer `audio/webm;codecs=opus`, then `audio/webm` | Use `audio/mp4` when supported | Prefer `audio/webm;codecs=opus`, then `audio/webm` | Deterministic recorder tests cover MIME selection, bounded prebuffering, tail capture, and cancellation |
 | 15-minute Realtime voice interview | Pending physical test | Pending physical test | Pending physical test | Mocked session/reconnect tests only |
 | Reconnect without duplicate typed answer | Pending network shaping | Pending network shaping | Pending network shaping | API/browser logic tests pass |
 | Evidence report and delivery separation | Pending current-stable smoke | Pending current-stable smoke | Pending current-stable smoke | Evaluator, API, React, local browser pass |
@@ -23,3 +24,18 @@ Status: automated semantics and text-mode flows pass locally. Physical voice-dev
 4. Repeat under the agreed packet-loss/jitter profile.
 5. Complete keyboard-only, 200% zoom, reduced-motion, and screen-reader checks.
 6. Record browser versions, OS, network profile, result, and issue IDs in the pilot log. Do not write résumé or transcript content into the log.
+
+## Candidate utterance capture
+
+Voice final-transcription capture requires the browser `MediaRecorder` API in
+addition to microphone access. The app selects only an allowlisted format in
+this order: `audio/webm;codecs=opus`, `audio/webm`, then `audio/mp4`. Current
+Chrome and Edge normally select WebM/Opus; Safari may select MP4 instead. If
+none of these formats is reported as supported, voice capture is unavailable
+and the app reports the browser limitation instead of recording an unknown
+format.
+
+Captured chunks remain in volatile browser memory only. Each candidate turn
+includes a small rolling prebuffer and 300 ms post-speech tail, then its chunk
+references are released after the Blob is handed to the caller. Manual browser
+testing must confirm the selected MIME type on the current stable release.
