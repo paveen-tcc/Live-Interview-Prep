@@ -118,11 +118,7 @@ export interface InterviewTurn {
   speaker: "user" | "assistant";
   transcript: string;
   transcription_source:
-    | "typed"
-    | "realtime_live"
-    | "final_model"
-    | "assistant"
-    | "legacy";
+    "typed" | "realtime_live" | "final_model" | "assistant" | "legacy";
   transcription_model: string | null;
   transcription_finalized_at: string | null;
   delivery_status: "pending" | "acknowledged";
