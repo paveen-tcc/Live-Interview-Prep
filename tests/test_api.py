@@ -41,6 +41,7 @@ from domain.evaluation import (
 )
 
 
+@pytest.mark.real_env_file
 def test_settings_load_optional_local_env_after_base_env(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
