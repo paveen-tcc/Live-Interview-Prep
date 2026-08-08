@@ -6,7 +6,9 @@ import {
   countUnicodeCharacters,
   prepareInputMedia,
   realtimeEventAcknowledgesTurn,
+  RealtimeTransport,
   typedAnswerError,
+  type RealtimeEvent,
 } from "./realtime";
 
 it("maps Realtime audio offsets to an absolute observable speech segment", () => {
@@ -103,5 +105,56 @@ describe("developer text Realtime input", () => {
         "My answer",
       ),
     ).toBe(true);
+  });
+});
+
+describe("voice transcription transport", () => {
+  it("represents Realtime transcription failures with safe structured fields", () => {
+    const event: RealtimeEvent = {
+      type: "conversation.item.input_audio_transcription.failed",
+      item_id: "item-1",
+      content_index: 0,
+      error: {
+        type: "server_error",
+        code: "transcription_failed",
+        message: "The transcription failed.",
+        param: null,
+      },
+    };
+
+    expect(event.type).toBe(
+      "conversation.item.input_audio_transcription.failed",
+    );
+    expect(event.item_id).toBe("item-1");
+    expect(event.error?.code).toBe("transcription_failed");
+  });
+
+  it("disables only audio sender tracks without stopping any sender", () => {
+    const stopAudio = vi.fn();
+    const stopVideo = vi.fn();
+    const audioTrack = { kind: "audio", enabled: true, stop: stopAudio };
+    const videoTrack = { kind: "video", enabled: true, stop: stopVideo };
+    const transport = new RealtimeTransport({
+      onEvent: vi.fn(),
+      onStateChange: vi.fn(),
+      onReady: vi.fn(),
+      onError: vi.fn(),
+    });
+    Object.assign(transport as unknown as Record<string, unknown>, {
+      peer: {
+        getSenders: () => [
+          { track: audioTrack },
+          { track: videoTrack },
+          { track: null },
+        ],
+      },
+    });
+
+    transport.setMicrophoneEnabled(false);
+
+    expect(audioTrack.enabled).toBe(false);
+    expect(videoTrack.enabled).toBe(true);
+    expect(stopAudio).not.toHaveBeenCalled();
+    expect(stopVideo).not.toHaveBeenCalled();
   });
 });

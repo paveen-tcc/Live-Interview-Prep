@@ -23,6 +23,12 @@ import type {
   User,
   UsageSummary,
 } from "./types";
+import type { RecordedUtterance } from "./voiceCapture";
+
+export type TranscriptionEventKind =
+  | "live_transcription_completed"
+  | "live_transcription_failed"
+  | "double_transcription_failure";
 
 export class ApiError extends Error {
   constructor(
@@ -225,6 +231,34 @@ export const api = {
     request<InterviewRuntime>(`/api/interviews/${interviewId}/turns:batch`, {
       method: "POST",
       body: JSON.stringify({ items }),
+    }),
+  transcribeTurn: async (
+    interviewId: string,
+    clientTurnId: string,
+    utterance: RecordedUtterance,
+  ) => {
+    const body = new FormData();
+    body.append("file", utterance.blob);
+    if (utterance.startedAt) body.append("started_at", utterance.startedAt);
+    if (utterance.endedAt) body.append("ended_at", utterance.endedAt);
+    return request<InterviewRuntime>(
+      `/api/interviews/${interviewId}/turns/${clientTurnId}:transcribe`,
+      { method: "POST", body },
+    );
+  },
+  acceptLiveTranscript: async (interviewId: string, clientTurnId: string) => {
+    return request<InterviewRuntime>(
+      `/api/interviews/${interviewId}/turns/${clientTurnId}:accept-live`,
+      { method: "POST" },
+    );
+  },
+  recordTranscriptionEvent: (
+    interviewId: string,
+    kind: TranscriptionEventKind,
+  ) =>
+    request<void>(`/api/interviews/${interviewId}/transcription-events`, {
+      method: "POST",
+      body: JSON.stringify({ kind }),
     }),
   completeInterview: (interviewId: string) =>
     request<InterviewRuntime>(`/api/interviews/${interviewId}/complete`, {

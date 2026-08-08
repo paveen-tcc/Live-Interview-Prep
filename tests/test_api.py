@@ -700,6 +700,15 @@ def test_final_transcription_openapi_documents_bounded_raw_multipart(
         "started_at": {"type": "string", "format": "date-time"},
         "ended_at": {"type": "string", "format": "date-time"},
     }
+    assert operation["responses"]["200"]["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/InterviewRuntimeResponse"
+    }
+    accept_operation = response.json()["paths"][
+        "/api/interviews/{interview_id}/turns/{client_turn_id}:accept-live"
+    ]["post"]
+    assert accept_operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ] == {"$ref": "#/components/schemas/InterviewRuntimeResponse"}
 
 
 @pytest.mark.parametrize("client_turn_id", ["ab", "bad.id", "x" * 97])
@@ -801,14 +810,23 @@ def test_final_transcription_upgrades_live_turn_once_and_late_live_is_noop(
         )
 
         assert finalized.status_code == repeated.status_code == 200
-        final_turn = finalized.json()
+        final_turn = next(
+            turn
+            for turn in finalized.json()["turns"]
+            if turn["client_turn_id"] == "candidate-answer"
+        )
+        repeated_turn = next(
+            turn
+            for turn in repeated.json()["turns"]
+            if turn["client_turn_id"] == "candidate-answer"
+        )
         assert final_turn["id"] == live_turn["id"]
         assert final_turn["sequence"] == live_turn["sequence"]
         assert final_turn["transcript"] == "I designed an idempotent payment API."
         assert final_turn["transcription_source"] == "final_model"
         assert final_turn["transcription_model"] == "final-stt-deployment"
         assert final_turn["transcription_finalized_at"] is not None
-        assert repeated.json() == final_turn
+        assert repeated_turn == final_turn
         assert len(provider_calls) == 1
         assert provider_calls[0]["audio"] == b"candidate-audio"
         assert provider_calls[0]["media_type"] == "audio/webm"
@@ -860,8 +878,18 @@ def test_final_transcription_upgrades_live_turn_once_and_late_live_is_noop(
             files={"file": ("late.webm", b"late", "audio/webm")},
         )
         assert finalized_after_end.status_code == after_end.status_code == 200
-        assert finalized_after_end.json()["transcription_source"] == "final_model"
-        assert after_end.json() == final_turn
+        finalized_after_end_turn = next(
+            turn
+            for turn in finalized_after_end.json()["turns"]
+            if turn["client_turn_id"] == "pre-boundary-live"
+        )
+        after_end_turn = next(
+            turn
+            for turn in after_end.json()["turns"]
+            if turn["client_turn_id"] == "candidate-answer"
+        )
+        assert finalized_after_end_turn["transcription_source"] == "final_model"
+        assert after_end_turn == final_turn
         assert new_after_end.status_code == 409
         assert len(provider_calls) == 2
 
@@ -939,10 +967,11 @@ def test_final_first_transcription_is_not_replaced_by_late_live_turn(
         )
 
     assert finalized.status_code == late_live.status_code == 200
-    assert finalized.json()["started_at"] == "2026-08-08T10:00:00Z"
-    assert finalized.json()["ended_at"] == "2026-08-08T10:00:03Z"
+    finalized_turn = finalized.json()["turns"][0]
+    assert finalized_turn["started_at"] == "2026-08-08T10:00:00Z"
+    assert finalized_turn["ended_at"] == "2026-08-08T10:00:03Z"
     assert len(late_live.json()["turns"]) == 1
-    assert late_live.json()["turns"][0] == finalized.json()
+    assert late_live.json()["turns"][0] == finalized_turn
 
 
 def test_final_transcription_rejects_invalid_input_before_provider(
@@ -1107,10 +1136,20 @@ def test_accept_live_finalizes_only_owned_live_candidate_turns(
         )
 
     assert accepted.status_code == repeated.status_code == 200
-    assert accepted.json() == repeated.json()
-    assert accepted.json()["transcription_source"] == "realtime_live"
-    assert accepted.json()["transcript"] == "I built a reliable API."
-    assert accepted.json()["transcription_finalized_at"] is not None
+    accepted_turn = next(
+        turn
+        for turn in accepted.json()["turns"]
+        if turn["client_turn_id"] == "live-turn"
+    )
+    repeated_turn = next(
+        turn
+        for turn in repeated.json()["turns"]
+        if turn["client_turn_id"] == "live-turn"
+    )
+    assert accepted_turn == repeated_turn
+    assert accepted_turn["transcription_source"] == "realtime_live"
+    assert accepted_turn["transcript"] == "I built a reliable API."
+    assert accepted_turn["transcription_finalized_at"] is not None
     assert assistant.status_code == typed.status_code == 409
     assert missing.status_code == foreign.status_code == 404
     with sqlite3.connect(database_path) as connection:
@@ -1119,6 +1158,77 @@ def test_accept_live_finalizes_only_owned_live_candidate_turns(
             (voice_interview["id"],),
         ).fetchall()
     assert fallback_events.count(("live_transcription_fallback", 1)) == 1
+
+
+def test_accept_live_returns_existing_final_runtime_without_fallback_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    database_path = tmp_path / "accept-existing-final.db"
+    settings = _dual_transcription_settings(database_path)
+
+    async def fake_transcription(**_kwargs: object) -> FinalTranscription:
+        return FinalTranscription(
+            text="The committed final transcript must remain authoritative.",
+            deployment="final-stt-deployment",
+            elapsed_ms=300,
+            attempts=1,
+        )
+
+    monkeypatch.setattr(
+        "api.routes.realtime.create_realtime_client_secret", _fake_realtime_secret
+    )
+    monkeypatch.setattr(
+        "api.routes.realtime.transcribe_candidate_audio", fake_transcription
+    )
+    with TestClient(create_app(settings)) as transcription_client:
+        interview = _ready_session(transcription_client)
+        _start_ready_interview(
+            transcription_client, interview["id"], input_mode="voice"
+        )
+        live = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns:batch",
+            json={
+                "items": [
+                    {
+                        "client_turn_id": "lost-final-response",
+                        "speaker": "user",
+                        "transcript": "The live transcript arrived first.",
+                    }
+                ]
+            },
+        )
+        assert live.status_code == 200
+        finalized = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/lost-final-response:transcribe",
+            files={"file": ("answer.webm", b"audio", "audio/webm")},
+        )
+        accepted = transcription_client.post(
+            f"/api/interviews/{interview['id']}/turns/lost-final-response:accept-live"
+        )
+
+    assert finalized.status_code == accepted.status_code == 200
+    finalized_turn = next(
+        turn
+        for turn in finalized.json()["turns"]
+        if turn["client_turn_id"] == "lost-final-response"
+    )
+    accepted_turn = next(
+        turn
+        for turn in accepted.json()["turns"]
+        if turn["client_turn_id"] == "lost-final-response"
+    )
+    assert accepted_turn == finalized_turn
+    assert accepted_turn["transcript"] == (
+        "The committed final transcript must remain authoritative."
+    )
+    assert accepted_turn["transcription_source"] == "final_model"
+    with sqlite3.connect(database_path) as connection:
+        fallback_events = connection.execute(
+            "SELECT COUNT(*) FROM usage_events "
+            "WHERE session_id = ? AND kind = 'live_transcription_fallback'",
+            (interview["id"],),
+        ).fetchone()[0]
+    assert fallback_events == 0
 
 
 def test_concurrent_final_first_requests_converge_on_sqlite(
@@ -1179,7 +1289,15 @@ def test_concurrent_final_first_requests_converge_on_sqlite(
             ]
 
     assert [response.status_code for response in responses] == [200, 200]
-    assert responses[0].json()["id"] == responses[1].json()["id"]
+    response_turns = [
+        next(
+            turn
+            for turn in response.json()["turns"]
+            if turn["client_turn_id"] == "race-final"
+        )
+        for response in responses
+    ]
+    assert response_turns[0]["id"] == response_turns[1]["id"]
     with sqlite3.connect(database_path) as connection:
         turn_count = connection.execute(
             "SELECT COUNT(*) FROM interview_turns WHERE client_turn_id = 'race-final'"

@@ -3,6 +3,7 @@ import type { InputMode } from "./types";
 export interface RealtimeEvent {
   type: string;
   item_id?: string;
+  content_index?: number;
   transcript?: string;
   delta?: string;
   audio_start_ms?: number;
@@ -12,7 +13,12 @@ export interface RealtimeEvent {
     role?: string;
     content?: Array<{ type?: string; text?: string; transcript?: string }>;
   };
-  error?: { message?: string };
+  error?: {
+    type?: string;
+    code?: string;
+    message?: string;
+    param?: string | null;
+  };
 }
 
 export function absoluteSpeechSegment(
@@ -192,6 +198,12 @@ export class RealtimeTransport {
 
   startInterview(): void {
     this.send({ type: "response.create" });
+  }
+
+  setMicrophoneEnabled(enabled: boolean): void {
+    for (const sender of this.peer?.getSenders() ?? []) {
+      if (sender.track?.kind === "audio") sender.track.enabled = enabled;
+    }
   }
 
   close(stopMedia = false): void {

@@ -221,6 +221,16 @@ def _runtime_response(
     )
 
 
+async def _runtime_for_user_id(
+    database: AsyncSession,
+    user_id: str,
+    interview_id: str,
+    settings: Settings,
+) -> InterviewRuntimeResponse:
+    interview = await _owned_interview_for_user_id(database, user_id, interview_id)
+    return _runtime_response(interview, await _turns(database, interview.id), settings)
+
+
 async def _enforce_secret_rate_limit(
     request: Request,
     database: AsyncSession,
@@ -629,7 +639,7 @@ async def _upsert_interview_turns_once(
 
 @router.post(
     "/{interview_id}/turns/{client_turn_id}:transcribe",
-    response_model=InterviewTurnResponse,
+    response_model=InterviewRuntimeResponse,
     openapi_extra={
         "requestBody": {
             "required": True,
@@ -661,7 +671,7 @@ async def finalize_candidate_transcription(
     request: Request,
     user: Annotated[User, Depends(get_current_user)],
     database: Annotated[AsyncSession, Depends(get_database_session)],
-) -> InterviewTurnResponse:
+) -> InterviewRuntimeResponse:
     settings: Settings = request.app.state.settings
     started = time.perf_counter()
     user_id = user.id
@@ -673,7 +683,9 @@ async def finalize_candidate_transcription(
         database, interview.id, client_turn_id, for_update=True
     )
     if existing is not None and existing.transcription_source == "final_model":
-        return _turn_response(existing)
+        return _runtime_response(
+            interview, await _turns(database, interview.id), settings
+        )
     if interview.input_mode != "voice":
         raise HTTPException(
             status_code=409,
@@ -763,7 +775,7 @@ async def finalize_candidate_transcription(
 
     for attempt in range(3):
         try:
-            turn, wrote_final = await _persist_final_transcription_once(
+            _turn, wrote_final = await _persist_final_transcription_once(
                 database=database,
                 user_id=user_id,
                 interview_id=interview_id,
@@ -783,7 +795,7 @@ async def finalize_candidate_transcription(
                         "latency_bucket": _latency_bucket(result.elapsed_ms),
                     },
                 )
-            return _turn_response(turn)
+            return await _runtime_for_user_id(database, user_id, interview_id, settings)
         except (IntegrityError, OperationalError) as exc:
             await database.rollback()
             if not _retryable_turn_write(exc) or attempt == 2:
@@ -870,14 +882,15 @@ async def _persist_final_transcription_once(
 
 @router.post(
     "/{interview_id}/turns/{client_turn_id}:accept-live",
-    response_model=InterviewTurnResponse,
+    response_model=InterviewRuntimeResponse,
 )
 async def accept_live_candidate_transcription(
     interview_id: str,
     client_turn_id: ClientTurnId,
+    request: Request,
     user: Annotated[User, Depends(get_current_user)],
     database: Annotated[AsyncSession, Depends(get_database_session)],
-) -> InterviewTurnResponse:
+) -> InterviewRuntimeResponse:
     user_id = user.id
     interview = await _owned_interview_for_user_id(
         database, user_id, interview_id, for_update=True
@@ -888,6 +901,12 @@ async def accept_live_candidate_transcription(
     )
     if turn is None:
         raise HTTPException(status_code=404, detail="Candidate turn was not found.")
+    if turn.speaker == "user" and turn.transcription_source == "final_model":
+        return _runtime_response(
+            interview,
+            await _turns(database, interview.id),
+            request.app.state.settings,
+        )
     if turn.speaker != "user" or turn.transcription_source != "realtime_live":
         raise HTTPException(
             status_code=409,
@@ -940,7 +959,12 @@ async def accept_live_candidate_transcription(
             status_code=409,
             detail="Only a live candidate transcript can be accepted as fallback.",
         )
-    return _turn_response(saved)
+    return await _runtime_for_user_id(
+        database,
+        user_id,
+        interview_id,
+        request.app.state.settings,
+    )
 
 
 @router.post("/{interview_id}/transcription-events", status_code=204)
