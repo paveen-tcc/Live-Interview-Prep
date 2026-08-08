@@ -16,6 +16,7 @@ import { PrivacyPage } from "./PrivacyPage";
 import { SetupPage } from "./SetupPage";
 import { PracticePage } from "./PracticePage";
 import { ReportPage } from "./ReportPage";
+import { statusPill, statusPillClass } from "./status";
 import type { InterviewSession, User } from "./types";
 
 type Theme = "light" | "dark";
@@ -376,8 +377,8 @@ export function App() {
                     <div className="session-card__content">
                       <div className="session-card__title-row">
                         <h3>{interview.title}</h3>
-                        <span className="badge">
-                          {interview.status.replaceAll("_", " ")}
+                        <span className={statusPillClass(interview.status)}>
+                          {statusPill(interview.status).label}
                         </span>
                       </div>
                       <p className="session-card__meta">

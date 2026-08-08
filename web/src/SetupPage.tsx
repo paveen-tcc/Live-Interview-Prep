@@ -8,6 +8,7 @@ import {
   FileIcon,
   UploadIcon,
 } from "./icons";
+import { statusPill, statusPillClass } from "./status";
 import type {
   CandidateProfile,
   InterviewSession,
@@ -460,8 +461,8 @@ export function SetupPage({
             Review the evidence, define the role, then tune the interview focus.
           </p>
         </div>
-        <span className={`badge badge--${interview.status.toLowerCase()}`}>
-          {interview.status.replaceAll("_", " ")}
+        <span className={statusPillClass(interview.status)}>
+          {statusPill(interview.status).label}
         </span>
       </section>
 
