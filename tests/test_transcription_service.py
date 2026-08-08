@@ -42,10 +42,12 @@ def _multipart_fields(request: httpx.Request) -> dict[str, str]:
 async def test_transcribes_candidate_audio_with_azure_multipart_contract() -> None:
     observed_headers: dict[str, str] = {}
     observed_form_fields: dict[str, str] = {}
+    observed_url: dict[str, str] = {}
 
     async def handler(request: httpx.Request) -> httpx.Response:
         observed_headers.update(request.headers)
         observed_form_fields.update(_multipart_fields(request))
+        observed_url["value"] = str(request.url)
         return httpx.Response(200, json={"text": "I built a FastAPI service."})
 
     async def no_sleep(_: float) -> None:
@@ -74,6 +76,15 @@ async def test_transcribes_candidate_audio_with_azure_multipart_contract() -> No
     )
     assert observed_form_fields["file"] == "candidate-audio"
     assert observed_headers["api-key"] == "server-key"
+    # The deployment-scoped audio route is the one Azure AI Foundry resources
+    # actually serve. The unified /openai/v1/audio/transcriptions surface
+    # answers DeploymentNotFound there, which would silently degrade every
+    # candidate answer to its live transcript.
+    assert observed_url["value"] == (
+        "https://example.services.ai.azure.com"
+        "/openai/deployments/final-stt-deployment/audio/transcriptions"
+        "?api-version=2024-06-01"
+    )
 
 
 @pytest.mark.asyncio

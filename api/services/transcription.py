@@ -114,6 +114,14 @@ async def transcribe_candidate_audio(
 
     key = settings.azure_openai_api_key.get_secret_value()
     headers = {"api-key": key}
+    # Azure AI Foundry resources serve audio transcription from the
+    # deployment-scoped route. The unified /openai/v1/audio/transcriptions
+    # surface answers DeploymentNotFound even when the deployment exists, which
+    # would degrade every candidate answer to its live transcript.
+    url = (
+        f"{root}/openai/deployments/{deployment}/audio/transcriptions"
+        f"?api-version={settings.azure_openai_transcription_api_version}"
+    )
     data = {
         "model": deployment,
         "language": settings.azure_openai_transcription_language,
@@ -130,7 +138,7 @@ async def transcribe_candidate_audio(
         for attempt in range(1, _MAX_ATTEMPTS + 1):
             try:
                 response = await resolved_client.post(
-                    f"{root}/openai/v1/audio/transcriptions",
+                    url,
                     headers=headers,
                     data=data,
                     files=files,

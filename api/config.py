@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     azure_openai_realtime_transcription_model: str | None = None
     azure_openai_final_transcription_deployment: str | None = None
     azure_openai_transcription_language: str = "en"
+    azure_openai_transcription_api_version: str = "2024-06-01"
     azure_openai_transcription_delay: Literal[
         "minimal", "low", "medium", "high", "xhigh"
     ] = "low"
