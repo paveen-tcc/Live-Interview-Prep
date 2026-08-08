@@ -15,6 +15,7 @@ dependencies = [
   "fastapi>=0.115,<1",
   "httpx>=0.28,<1",
   "openai>=2.53,<3",
+  "pyjwt[crypto]>=2.10,<3",
   "pypdf>=6.0,<7",
   "pydantic-settings>=2.7,<3",
   "python-docx>=1.2,<2",
@@ -36,12 +37,11 @@ dev = [
 include = ["api*", "domain*", "prompts*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests", "prototype/tests"]
+testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
 
 [tool.ruff]
-exclude = ["prototype"]
 line-length = 88
 target-version = "py311"
 

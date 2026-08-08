@@ -1,0 +1,34 @@
+name: Deploy
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: zerops-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # Skipped until the Zerops service id is configured, so the workflow can
+    # land before the project exists.
+    if: ${{ vars.ZEROPS_SERVICE_ID != '' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      # Zerops runs the build itself from zerops.yml; this step only uploads the
+      # repository and triggers that pipeline.
+      - name: Deploy to Zerops
+        uses: zeropsio/actions@main
+        with:
+          access-token: ${{ secrets.ZEROPS_TOKEN }}
+          service-id: ${{ vars.ZEROPS_SERVICE_ID }}
+      - name: Verify the deployment is serving
+        run: |
+          curl --fail --show-error --retry 10 --retry-delay 6 \
+            "${{ vars.APP_URL }}/api/health/ready"

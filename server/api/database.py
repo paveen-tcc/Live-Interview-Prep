@@ -6,6 +6,7 @@ import asyncio
 import socket
 import ssl
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -23,25 +24,46 @@ from .models import Base
 
 _NEON_IPV4_ADAPTER_HOSTS = "_interview_coach_neon_ipv4_hosts"
 
+# Managed PostgreSQL providers that terminate TLS themselves and hand out URLs
+# carrying libpq-style query options asyncpg does not understand.
+_MANAGED_POSTGRES_SUFFIXES = (".neon.tech", ".supabase.co", ".supabase.com")
+
+# Supabase's Supavisor pooler runs transaction pooling on 6543 and session
+# pooling on 5432. Transaction pooling multiplexes one server connection across
+# clients, so server-side prepared statements cannot be reused.
+_SUPAVISOR_TRANSACTION_PORT = 6543
+
+
+def _is_managed_postgres_host(hostname: str | None) -> bool:
+    return bool(hostname and hostname.endswith(_MANAGED_POSTGRES_SUFFIXES))
+
 
 def normalized_database_url(database_url: str) -> str:
     if database_url.startswith("postgresql://"):
         database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
 
     parsed = urlsplit(database_url)
-    if parsed.hostname and parsed.hostname.endswith(".neon.tech"):
+    if _is_managed_postgres_host(parsed.hostname):
         query = []
         for key, value in parse_qsl(parsed.query, keep_blank_values=True):
-            if key in {"channel_binding", "sslmode"}:
+            if key in {"channel_binding", "sslmode", "pgbouncer"}:
                 # SQLAlchemy passes URI query options to asyncpg as keyword
                 # arguments. asyncpg accepts `ssl`, not `sslmode`, and treats
                 # channel_binding as a server setting. Engine construction adds
-                # a verified SSLContext for Neon instead.
+                # a verified SSLContext instead.
                 continue
             query.append((key, value))
         return urlunsplit(parsed._replace(query=urlencode(query)))
 
     return database_url
+
+
+def uses_transaction_pooler(database_url: str) -> bool:
+    parsed = urlsplit(normalized_database_url(database_url))
+    return (
+        _is_managed_postgres_host(parsed.hostname)
+        and parsed.port == _SUPAVISOR_TRANSACTION_PORT
+    )
 
 
 def database_connect_args(
@@ -51,18 +73,50 @@ def database_connect_args(
     if normalized.startswith("sqlite"):
         return {"check_same_thread": False}
     hostname = urlsplit(normalized).hostname
-    if hostname and hostname.endswith(".neon.tech"):
-        return {
-            "ssl": ssl.create_default_context(cafile=certifi.where()),
-            "timeout": timeout_seconds,
-        }
+    if not _is_managed_postgres_host(hostname):
+        return {}
+    connect_args: dict[str, object] = {
+        "ssl": ssl.create_default_context(cafile=certifi.where()),
+        "timeout": timeout_seconds,
+    }
+    if uses_transaction_pooler(database_url):
+        # Without this asyncpg reuses prepared statement names across pooled
+        # server connections and Supavisor answers with DuplicatePreparedStatement.
+        connect_args["statement_cache_size"] = 0
+    return connect_args
+
+
+def ensure_sqlite_parent_directory(database_url: str) -> None:
+    """Create the directory holding a SQLite file so first boot can write it."""
+
+    normalized = normalized_database_url(database_url)
+    if not normalized.startswith("sqlite"):
+        return
+    _, _, location = normalized.partition("///")
+    location = location.split("?", 1)[0]
+    if location and location != ":memory:":
+        Path(location).parent.mkdir(parents=True, exist_ok=True)
+
+
+def database_engine_options(database_url: str) -> dict[str, object]:
+    """Dialect-level engine options for the given database URL."""
+
+    if uses_transaction_pooler(database_url):
+        # SQLAlchemy keeps its own asyncpg prepared-statement cache on top of
+        # asyncpg's; both have to be off behind a transaction pooler.
+        return {"prepared_statement_cache_size": 0}
     return {}
 
 
 def install_database_network_compatibility(
     database_url: str, *, loop: Any | None = None
 ) -> None:
-    """Prefer IPv4 for Neon while preserving its hostname for verified TLS."""
+    """Prefer IPv4 for Neon while preserving its hostname for verified TLS.
+
+    Deliberately Neon-only. Supabase's direct connection endpoint resolves to
+    IPv6 exclusively, so pinning AF_INET there would break it outright; reach
+    Supabase through the IPv4-capable Supavisor pooler instead.
+    """
     hostname = urlsplit(normalized_database_url(database_url)).hostname
     if not hostname or not hostname.endswith(".neon.tech"):
         return
@@ -104,6 +158,7 @@ def create_database(
             settings.database_url,
             timeout_seconds=settings.database_connect_timeout_seconds,
         ),
+        **database_engine_options(settings.database_url),
     )
     return engine, async_sessionmaker(engine, expire_on_commit=False)
 

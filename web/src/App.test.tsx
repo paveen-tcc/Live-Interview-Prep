@@ -90,14 +90,12 @@ describe("session dashboard", () => {
     render(<App />);
 
     expect(
-      await screen.findByRole("heading", { name: "Sign in with your email" }),
+      await screen.findByRole("heading", { name: "Your session has expired" }),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/No password or Microsoft account is required/),
+      screen.getByText(/Reload the page to sign in again/),
     ).toBeInTheDocument();
-    expect(
-      screen.getByRole("link", { name: "Continue with email" }),
-    ).toHaveAttribute("href", "/.auth/login/aad?post_login_redirect_uri=/");
+    expect(screen.getByRole("button", { name: "Reload" })).toBeInTheDocument();
   });
 
   it("shows editable M2 data with visible resume and JD sources", async () => {

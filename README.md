@@ -1,25 +1,26 @@
 # AI Interview Coach
 
 A browser-based interview-practice product built as one React + TypeScript and
-FastAPI application. The local build now covers the M1–M6 product path: secure
-résumé/JD setup, browser Realtime interviews with a quiet-room text mode,
-evidence-backed reports, optional speaking-delivery coaching, and private-alpha
-quota, retention, deletion, and usage controls. Cloud deployment remains
-intentionally deferred during local product development.
+FastAPI application. It covers the M1–M6 product path: secure résumé/JD setup,
+browser Realtime interviews with a quiet-room text mode, evidence-backed
+reports, optional speaking-delivery coaching, and private-alpha quota,
+retention, deletion, and usage controls.
 
-The completed desktop experiment is preserved under [`prototype/`](prototype/README.md).
+It deploys to [Zerops](https://docs.zerops.io/) as a single service, with
+PostgreSQL on Supabase and sign-in through Clerk.
 
 ## Repository layout
 
 ```text
-api/          FastAPI routes, auth, persistence, and M2 application services
-domain/       Validated candidate-profile and scorecard contracts
+server/       FastAPI application, domain contracts, migrations, and tests
 web/          React + TypeScript dashboard and Vite build
-migrations/   Alembic database migrations
-tests/        Backend unit, security, integration, and migration tests
-infra/        Staging deployment contract
-prototype/    Preserved M0 desktop experiments
+zerops.yml    Build and deploy pipeline
+zerops-import.yml
+              One-time Zerops infrastructure definition
 ```
+
+Working notes, specs, plans, and the preserved M0 desktop prototype live in
+`.meta/`, which is deliberately untracked. Nothing in the build depends on it.
 
 ## Local development
 
@@ -28,17 +29,18 @@ Python 3.11+ and Node.js 22.14+ are recommended.
 ```bash
 python -m venv venv
 source venv/bin/activate
-python -m pip install -e ".[dev]"
+python -m pip install -e "./server[dev]"
 npm --prefix web install
 ```
 
 The default local configuration uses a file-backed SQLite database and an
-explicit local developer identity. Custom passwords are never implemented.
+explicit local developer identity, so there is no sign-in step and no Clerk
+account needed to run the app locally.
 
-Run the API:
+Run the API from the `server/` directory:
 
 ```bash
-uvicorn api.main:app --reload
+cd server && uvicorn api.main:app --reload
 ```
 
 In another terminal, run the Vite client:
@@ -126,7 +128,7 @@ with `AZURE_OPENAI_FINAL_TRANSCRIPTION_TIMEOUT_SECONDS` (default 30) and
 
 Answer audio is buffered in browser memory and streamed through the API to
 Azure without ever being written to disk on either side. See
-[docs/RETENTION_AND_DELETION.md](docs/RETENTION_AND_DELETION.md) for the exact
+`.meta/docs/RETENTION_AND_DELETION.md` for the exact
 lifecycle and release points.
 
 Transcription is not infallible. When the final lane fails the interview
@@ -140,7 +142,7 @@ transcript-provenance columns. The head revision is `20260808_0008`.
 For an Alembic-managed database:
 
 ```bash
-alembic upgrade head
+cd server && alembic upgrade head
 ```
 
 For a database first created with `AUTO_CREATE_SCHEMA=true`, `upgrade head`
@@ -149,6 +151,7 @@ fails with "table users already exists": the tables exist but no
 before upgrading:
 
 ```bash
+cd server
 alembic stamp 20260807_0007
 alembic upgrade head
 ```
@@ -187,6 +190,7 @@ Apply the schema, then start the API:
 
 ```bash
 source venv/bin/activate
+cd server
 alembic upgrade head
 uvicorn api.main:app --reload
 ```
@@ -194,8 +198,42 @@ uvicorn api.main:app --reload
 In another terminal, start the dashboard with `npm --prefix web run dev`. Create
 a session and refresh to confirm that it persists in Neon.
 
-`compose.yaml` remains available as an offline PostgreSQL alternative. SQLite
-remains the default zero-setup option.
+SQLite remains the default zero-setup option for local work.
+
+### Use Supabase PostgreSQL
+
+Supabase is the deployed database. In the Supabase dashboard open **Project
+Settings → Database → Connection string → URI** and copy the **session pooler**
+URL, which looks like:
+
+```text
+postgresql://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
+```
+
+Three details matter, and the application handles each of them for you:
+
+- **Use the pooler, not the direct endpoint.** `db.PROJECTREF.supabase.co`
+  resolves over IPv6 only, which many hosts cannot reach. The pooler is
+  IPv4-capable.
+- **Port 5432 is session mode; 6543 is transaction mode.** Session mode is the
+  simpler default. If you do use 6543, the app detects the port and turns off
+  both asyncpg's and SQLAlchemy's prepared-statement caches, because a
+  transaction pooler multiplexes connections and would otherwise fail with
+  `DuplicatePreparedStatement`.
+- **`sslmode` and `channel_binding` are stripped** from the URL before it
+  reaches asyncpg, which does not accept them. TLS is still verified against
+  certifi's root store.
+
+Set in `.env`:
+
+```text
+APP_ENV=local
+AUTH_MODE=local
+AUTO_CREATE_SCHEMA=false
+DATABASE_URL=postgresql://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
+```
+
+Then apply the schema with `cd server && alembic upgrade head`.
 
 ### Private-alpha privacy and operations
 
@@ -208,43 +246,95 @@ idempotent and a PII-free terminal receipt prevents silent recreation.
 Run configured retention cleanup with:
 
 ```bash
-python scripts/run_retention.py
+cd server && python scripts/run_retention.py
 ```
 
-See [retention and deletion](docs/RETENTION_AND_DELETION.md), the [browser and
-accessibility matrix](docs/BROWSER_COMPATIBILITY.md), the [incident
-runbook](docs/INCIDENT_RUNBOOK.md), and the [private-alpha exit
-checklist](docs/PRIVATE_ALPHA_CHECKLIST.md).
+Operational references — retention and deletion, the browser and
+accessibility matrix, the incident runbook, and the private-alpha exit
+checklist — live under `.meta/docs/`, which is untracked and local-only.
 
 ## One-artifact production build
 
 ```bash
 npm --prefix web run build
-uvicorn api.main:app --host 127.0.0.1 --port 8000
+cd server && uvicorn api.main:app --host 127.0.0.1 --port 8000
 ```
 
-FastAPI serves `web/dist` and all `/api` routes from the same origin. The
-multi-stage `Dockerfile` builds this exact arrangement.
+FastAPI serves `web/dist` and all `/api` routes from the same origin, so there
+is no CORS configuration and no second domain. Zerops builds this same
+arrangement.
 
-## Authentication environments
+## Authentication
 
-- `local`: the server supplies one explicit developer identity for local work.
-- `staging` and `production`: configuration requires PostgreSQL,
-  `AUTH_MODE=easy_auth`, and schema migrations. Microsoft Entra External ID sends
-  a one-time code to the user's email; users do not create a password or need a
-  Microsoft account. FastAPI trusts only Azure Container Apps managed-auth
-  headers and never accepts browser-selected users.
+- `local`: the server supplies one explicit developer identity. No sign-in, no
+  Clerk account, no tokens. This is the default and what CI runs.
+- `clerk`: the browser sends a Clerk session token as a bearer token and the
+  server verifies its RS256 signature, issuer, expiry, and authorized party
+  before trusting the subject. Required in staging and production, alongside
+  PostgreSQL and Alembic-owned schema.
 
-Unauthenticated staging users see a passwordless email sign-in action. Every
-session query is scoped to the authenticated database user.
+### Clerk setup
+
+1. Create a Clerk application. For a Zerops `*.zerops.app` URL use the
+   **development** instance keys — a Clerk production instance requires a custom
+   domain with a CNAME record, which a platform subdomain cannot satisfy.
+2. **Add email and name to the session token.** Clerk's default session token
+   contains neither, and the API rejects a token without an email. Under
+   **Configure → Sessions → Customize session token**, set:
+
+   ```json
+   { "email": "{{user.primary_email_address}}", "name": "{{user.full_name}}" }
+   ```
+
+3. Set `CLERK_SECRET_KEY` and `CLERK_PUBLISHABLE_KEY`. Copy the PEM public key
+   into `CLERK_JWT_KEY` so verification never makes a network call.
+4. The web build reads `VITE_CLERK_PUBLISHABLE_KEY` at build time. Without it,
+   the client renders no sign-in and expects `AUTH_MODE=local`.
+
+The Content-Security-Policy adds Clerk's origins only when `AUTH_MODE=clerk`,
+including `challenges.cloudflare.com` for Clerk's bot protection widget.
+
+## Deployment (Zerops)
+
+One-time setup:
+
+```bash
+zcli login
+zcli project project-import zerops-import.yml
+```
+
+Then set the real secrets in the Zerops GUI under **Service → Environment
+variables** — `zerops-import.yml` ships placeholders on purpose.
+
+Repeat deploys run from [`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)
+on every push to `develop`. It needs:
+
+- Repository secret `ZEROPS_TOKEN` (Zerops → Settings → Access Token Management)
+- Repository variables `ZEROPS_SERVICE_ID` and `APP_URL`
+
+The workflow is skipped while `ZEROPS_SERVICE_ID` is unset, so it can land
+before the project exists. Zerops runs the build itself from
+[`zerops.yml`](zerops.yml): Vite compiles the client, `web/dist` and `server/`
+are deployed under `/var/www`, `alembic upgrade head` runs on each container
+start, and readiness is gated on `/api/health/ready`.
+
+`server/requirements.txt` is what Zerops installs at runtime, because the
+prepare container cannot see the build tree and so cannot `pip install .`. Keep
+it in sync with `[project].dependencies` in `server/pyproject.toml`.
 
 ## Verification
+
+Backend, from `server/`:
 
 ```bash
 python -m ruff format --check api domain evals migrations prompts scripts tests
 python -m ruff check api domain evals migrations prompts scripts tests
 python -m pytest tests
-python -m unittest discover -s prototype/tests -v
+```
+
+Frontend:
+
+```bash
 npm --prefix web run format:check
 npm --prefix web run lint
 npm --prefix web run typecheck
@@ -252,9 +342,7 @@ npm --prefix web run test
 npm --prefix web run build
 ```
 
-CI repeats these checks and builds the OCI container. Azure staging is currently
-deferred; the retained deployment contract is documented in
-[`infra/staging/README.md`](infra/staging/README.md).
+CI repeats these checks on pull requests and on pushes to `main` and `develop`.
 
 ## M3 manual acceptance test
 
@@ -272,5 +360,5 @@ deferred; the retained deployment contract is documented in
 
 Voice-mode completion on current Chrome, Safari, and Edge, plus the documented
 latency and impaired-network measurements, remain manual M3 release checks.
-The dual-transcription degradation matrix in the [private-alpha exit
-checklist](docs/PRIVATE_ALPHA_CHECKLIST.md) is also a manual check.
+The dual-transcription degradation matrix in
+`.meta/docs/PRIVATE_ALPHA_CHECKLIST.md` is also a manual check.

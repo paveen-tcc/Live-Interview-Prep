@@ -1,0 +1,19 @@
+# Runtime dependencies for the Zerops deployment.
+#
+# Zerops installs these in the runtime container via run.prepareCommands, which
+# has no access to the built source tree, so it cannot `pip install .` from
+# pyproject.toml. Keep this list identical to [project].dependencies there.
+alembic>=1.14,<2
+aiosqlite>=0.20,<1
+asyncpg>=0.29,<1
+certifi>=2025.1.31
+fastapi>=0.115,<1
+httpx>=0.28,<1
+openai>=2.53,<3
+pyjwt[crypto]>=2.10,<3
+pypdf>=6.0,<7
+pydantic-settings>=2.7,<3
+python-docx>=1.2,<2
+python-multipart>=0.0.20,<1
+sqlalchemy[asyncio]>=2.0,<3
+uvicorn[standard]>=0.34,<1

@@ -41,8 +41,22 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Supplies the bearer token for API calls. Registered by the Clerk provider at
+ * startup; left unset in local development, where the backend derives identity
+ * from configuration instead of a token.
+ */
+export type AuthTokenProvider = () => Promise<string | null>;
+
+let authTokenProvider: AuthTokenProvider | null = null;
+
+export function setAuthTokenProvider(provider: AuthTokenProvider | null): void {
+  authTokenProvider = provider;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const isFormData = init?.body instanceof FormData;
+  const token = authTokenProvider ? await authTokenProvider() : null;
   const response = await fetch(path, {
     ...init,
     headers: {
@@ -50,6 +64,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       ...(init?.body && !isFormData
         ? { "Content-Type": "application/json" }
         : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
       ...init?.headers,
     },
   });

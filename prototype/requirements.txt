@@ -1,6 +1,0 @@
-openai[realtime]
-certifi
-sounddevice
-numpy
-opencv-python
-python-dotenv

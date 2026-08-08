@@ -1,0 +1,67 @@
+# Zerops build and deploy pipeline.
+#
+# One service builds both halves of the app: Vite compiles the React client and
+# FastAPI serves the resulting bundle, so there is no second origin, no CORS,
+# and one certificate. `setup` must match the service hostname in
+# zerops-import.yml.
+zerops:
+  - setup: app
+
+    build:
+      # Ubuntu rather than the Alpine default: asyncpg, cryptography, and the
+      # uvicorn[standard] extras all ship glibc wheels, so nothing is compiled
+      # from source at deploy time.
+      os: ubuntu
+      base:
+        - python@3.12
+        - nodejs@22
+      envVariables:
+        # Vite inlines this at build time; the publishable key is not a secret.
+        VITE_CLERK_PUBLISHABLE_KEY: ${CLERK_PUBLISHABLE_KEY}
+      buildCommands:
+        - cd web && npm ci && npm run build
+      # Paths are preserved under /var/www, giving /var/www/server and
+      # /var/www/web/dist. api.config resolves the web bundle relative to the
+      # server directory, so this layout matches local development exactly.
+      deployFiles:
+        - server
+        - web/dist
+      cache:
+        - web/node_modules
+      # Runtime dependency installation happens in a container that cannot see
+      # the build tree, so the requirements file is handed over explicitly.
+      addToRunPrepare:
+        - server/requirements.txt
+
+    deploy:
+      # SQLite is gone, so containers no longer contend for a single file and
+      # deploys can overlap for zero downtime.
+      temporaryShutdown: false
+      readinessCheck:
+        httpGet:
+          port: 8000
+          path: /api/health/ready
+
+    run:
+      os: ubuntu
+      base: python@3.12
+      prepareCommands:
+        - python3 -m pip install --ignore-installed -r server/requirements.txt
+      initCommands:
+        # Runs on every container start. Alembic is idempotent, so re-running an
+        # already-applied head is a no-op.
+        - cd server && python3 -m alembic upgrade head
+      ports:
+        - port: 8000
+          httpSupport: true
+      healthCheck:
+        httpGet:
+          port: 8000
+          path: /api/health/live
+      start: cd server && python3 -m uvicorn api.main:app --host 0.0.0.0 --port 8000
+      envVariables:
+        APP_ENV: production
+        AUTH_MODE: clerk
+        AUTO_CREATE_SCHEMA: false
+        WEB_DIST_DIR: /var/www/web/dist
+        ENABLE_TEXT_DEV_MODE: false

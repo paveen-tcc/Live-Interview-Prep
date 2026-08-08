@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from api.config import get_settings
 from api.database import (
     database_connect_args,
+    database_engine_options,
     install_database_network_compatibility,
     normalized_database_url,
 )
@@ -56,6 +57,7 @@ async def run_migrations_online() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
         connect_args=database_connect_args(settings.database_url),
+        **database_engine_options(settings.database_url),
     )
     async with connectable.connect() as connection:
         await connection.run_sync(run_sync_migrations)

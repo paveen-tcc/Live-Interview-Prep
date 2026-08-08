@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { api, ApiError } from "./api";
+import { AccountButton } from "./auth";
+import { clerkEnabled } from "./authConfig";
 import { ConfirmationDialog } from "./ConfirmationDialog";
 import {
   ClockIcon,
@@ -160,17 +162,17 @@ export function App() {
             <span>AI Interview Coach</span>
           </div>
           <p className="section__eyebrow">Private workspace</p>
-          <h1 id="sign-in-title">Sign in with your email</h1>
+          <h1 id="sign-in-title">Your session has expired</h1>
           <p className="section__lede">
-            We’ll email you a one-time code. No password or Microsoft account is
-            required.
+            Reload the page to sign in again and pick up where you left off.
           </p>
-          <a
+          <button
             className="btn btn--primary"
-            href="/.auth/login/aad?post_login_redirect_uri=/"
+            type="button"
+            onClick={() => window.location.reload()}
           >
-            Continue with email
-          </a>
+            Reload
+          </button>
         </section>
       </main>
     );
@@ -198,9 +200,17 @@ export function App() {
         >
           {theme === "light" ? <MoonIcon /> : <SunIcon />}
         </button>
-        <div className="avatar" title={user?.email} aria-label="Signed-in user">
-          {user?.display_name.slice(0, 1).toUpperCase() ?? "…"}
-        </div>
+        {clerkEnabled ? (
+          <AccountButton />
+        ) : (
+          <div
+            className="avatar"
+            title={user?.email}
+            aria-label="Signed-in user"
+          >
+            {user?.display_name.slice(0, 1).toUpperCase() ?? "…"}
+          </div>
+        )}
       </header>
 
       <aside className="sidebar" aria-label="Primary navigation">

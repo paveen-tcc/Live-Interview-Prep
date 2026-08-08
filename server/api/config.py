@@ -9,9 +9,14 @@ from typing import Literal
 from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATABASE_PATH = PROJECT_ROOT / "data" / "interview_coach.db"
-ENV_FILES = (PROJECT_ROOT / ".env", PROJECT_ROOT / ".env.local")
+# ``server/`` holds the Python application; the repository root above it holds
+# ``web/`` and the local-only ``.env``/``data`` directories. On Zerops the same
+# relationship holds: the app runs from ``/var/www/server`` and the React build
+# is deployed to ``/var/www/web/dist``.
+SERVER_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = SERVER_ROOT.parent
+DEFAULT_DATABASE_PATH = REPO_ROOT / "data" / "interview_coach.db"
+ENV_FILES = (REPO_ROOT / ".env", REPO_ROOT / ".env.local")
 
 
 class Settings(BaseSettings):
@@ -21,11 +26,23 @@ class Settings(BaseSettings):
     database_url: str = f"sqlite+aiosqlite:///{DEFAULT_DATABASE_PATH.as_posix()}"
     database_connect_timeout_seconds: float = 10.0
     auto_create_schema: bool = True
-    auth_mode: Literal["local", "easy_auth"] = "local"
+    auth_mode: Literal["local", "clerk"] = "local"
     local_auth_subject: str = "local-developer"
     local_auth_email: str = "developer@local.test"
     local_auth_name: str = "Local developer"
-    web_dist_dir: Path = PROJECT_ROOT / "web" / "dist"
+    clerk_secret_key: SecretStr | None = None
+    clerk_publishable_key: str | None = None
+    # PEM public key from the Clerk dashboard. When present the backend verifies
+    # session tokens locally instead of fetching JWKS on a cache miss.
+    clerk_jwt_key: str | None = None
+    # Origins allowed to mint the session token, guarding against tokens issued
+    # for a different application. Comma-separated in the environment.
+    clerk_authorized_parties: str | None = None
+    # Clerk's Frontend API origin, needed in the CSP. Development instances all
+    # live under ``*.clerk.accounts.dev``, which the CSP allows by default; a
+    # production instance on a custom domain must set this explicitly.
+    clerk_frontend_api_url: str | None = None
+    web_dist_dir: Path = REPO_ROOT / "web" / "dist"
     enable_text_dev_mode: bool = False
     typed_answer_max_characters: int = 20_000
     realtime_client_secret_ttl_seconds: int = 120
@@ -79,15 +96,33 @@ class Settings(BaseSettings):
                 raise ValueError(
                     "DATABASE_URL must be PostgreSQL in staging and production."
                 )
-            if self.auth_mode != "easy_auth":
-                raise ValueError(
-                    "AUTH_MODE must be easy_auth in staging and production."
-                )
+            if self.auth_mode != "clerk":
+                raise ValueError("AUTH_MODE must be clerk in staging and production.")
             if self.auto_create_schema:
                 raise ValueError(
-                    "AUTO_CREATE_SCHEMA must be false in staging and production."
+                    "AUTO_CREATE_SCHEMA must be false in staging and production. "
+                    "Alembic owns the schema outside local development."
                 )
+        if self.auth_mode == "clerk" and not self.clerk_configured:
+            raise ValueError(
+                "CLERK_SECRET_KEY and CLERK_PUBLISHABLE_KEY are required when "
+                "AUTH_MODE is clerk."
+            )
         return self
+
+    @property
+    def clerk_configured(self) -> bool:
+        secret = (
+            self.clerk_secret_key.get_secret_value().strip()
+            if self.clerk_secret_key
+            else ""
+        )
+        return bool(secret and (self.clerk_publishable_key or "").strip())
+
+    @property
+    def clerk_authorized_party_list(self) -> list[str]:
+        raw = self.clerk_authorized_parties or ""
+        return [party.strip() for party in raw.split(",") if party.strip()]
 
     @property
     def llm_profile_configured(self) -> bool:

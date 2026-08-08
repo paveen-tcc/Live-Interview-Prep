@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import inspect
 import io
 import json
@@ -9,13 +8,18 @@ import socket
 import sqlite3
 import ssl
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 
+import jwt
 import pytest
 from alembic import command
 from alembic.config import Config
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
 from docx import Document
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
@@ -25,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 import api.database as database
 import api.routes.realtime as realtime_routes
-from api.config import PROJECT_ROOT, Settings, get_settings
+from api.config import REPO_ROOT, SERVER_ROOT, Settings, get_settings
 from api.database import (
     database_connect_args,
     normalized_database_url,
@@ -39,6 +43,70 @@ from domain.evaluation import (
     EvaluationReport,
     EvidenceCitation,
 )
+
+_CLERK_ISSUER = "https://clerk.example.test"
+_CLERK_AUTHORIZED_PARTY = "https://app.example.test"
+
+
+@lru_cache(maxsize=1)
+def _clerk_keys() -> tuple[str, str]:
+    """A throwaway RSA pair standing in for a Clerk instance's signing key.
+
+    Handing the public half to the app as ``clerk_jwt_key`` keeps verification
+    networkless, so the suite never reaches for a JWKS endpoint.
+    """
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    private_pem = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    public_pem = (
+        private_key.public_key()
+        .public_bytes(
+            serialization.Encoding.PEM,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        .decode()
+    )
+    return private_pem, public_pem
+
+
+def _clerk_settings(**overrides: object) -> Settings:
+    _, public_pem = _clerk_keys()
+    values: dict[str, object] = {
+        "_env_file": None,
+        "app_env": "test",
+        "auth_mode": "clerk",
+        "clerk_secret_key": "sk_test_example",
+        "clerk_publishable_key": "pk_test_example",
+        "clerk_frontend_api_url": _CLERK_ISSUER,
+        "clerk_jwt_key": public_pem,
+        "clerk_authorized_parties": _CLERK_AUTHORIZED_PARTY,
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def _clerk_claims(subject: str, email: str) -> dict[str, object]:
+    now = int(time.time())
+    return {
+        "sub": subject,
+        "email": email,
+        "name": email.split("@", 1)[0],
+        "iss": _CLERK_ISSUER,
+        "azp": _CLERK_AUTHORIZED_PARTY,
+        "iat": now,
+        "nbf": now,
+        "exp": now + 3600,
+    }
+
+
+def _principal_headers(subject: str, email: str) -> dict[str, str]:
+    private_pem, _ = _clerk_keys()
+    token = jwt.encode(_clerk_claims(subject, email), private_pem, algorithm="RS256")
+    return {"Authorization": f"Bearer {token}"}
 
 
 @pytest.mark.real_env_file
@@ -65,8 +133,8 @@ def test_settings_load_optional_local_env_after_base_env(
     assert settings.database_url == "sqlite+aiosqlite:///./data/interview_coach.db"
     assert settings.auto_create_schema is True
     assert Settings.model_config["env_file"] == (
-        PROJECT_ROOT / ".env",
-        PROJECT_ROOT / ".env.local",
+        REPO_ROOT / ".env",
+        REPO_ROOT / ".env.local",
     )
 
 
@@ -107,14 +175,18 @@ def test_settings_reject_local_auth_and_sqlite_in_staging(tmp_path: Path) -> Non
 
 
 def test_staging_accepts_managed_auth_with_postgresql() -> None:
-    settings = Settings(
+    settings = _clerk_settings(
         app_env="staging",
-        auth_mode="easy_auth",
         database_url="postgresql+asyncpg://user:password@database/app",
         auto_create_schema=False,
     )
 
-    assert settings.auth_mode == "easy_auth"
+    assert settings.auth_mode == "clerk"
+
+
+def test_clerk_auth_mode_requires_clerk_credentials() -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, app_env="test", auth_mode="clerk")
 
 
 def test_neon_url_is_safe_for_asyncpg() -> None:
@@ -1045,10 +1117,7 @@ def test_accept_live_finalizes_only_owned_live_candidate_turns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     database_path = tmp_path / "accept-live.db"
-    transcription_settings = Settings(
-        _env_file=None,
-        app_env="test",
-        auth_mode="easy_auth",
+    transcription_settings = _clerk_settings(
         database_url=f"sqlite+aiosqlite:///{database_path}",
         auto_create_schema=True,
         web_dist_dir=tmp_path / "missing-dist",
@@ -2114,60 +2183,33 @@ def test_database_engine_hides_private_parameters(client: TestClient) -> None:
     assert client.app.state.engine.sync_engine.hide_parameters is True
 
 
-def _principal_headers(subject: str, email: str) -> dict[str, str]:
-    principal = {
-        "claims": [
-            {"typ": "oid", "val": subject},
-            {"typ": "preferred_username", "val": email},
-            {"typ": "name", "val": email.split("@", 1)[0]},
-        ]
-    }
-    encoded = base64.b64encode(json.dumps(principal).encode()).decode()
-    return {"X-MS-CLIENT-PRINCIPAL": encoded}
-
-
-def test_managed_auth_accepts_external_id_email_claim(tmp_path: Path) -> None:
-    easy_auth_settings = Settings(
-        app_env="test",
-        auth_mode="easy_auth",
-        database_url=f"sqlite+aiosqlite:///{tmp_path / 'external-id.db'}",
+def test_clerk_session_token_creates_the_signed_in_user(tmp_path: Path) -> None:
+    clerk_settings = _clerk_settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'clerk.db'}",
         auto_create_schema=True,
         web_dist_dir=tmp_path / "missing-dist",
     )
-    principal = {
-        "claims": [
-            {"typ": "sub", "val": "external-user"},
-            {"typ": "emails", "val": '["candidate@example.test"]'},
-            {"typ": "name", "val": "Candidate"},
-        ]
-    }
-    headers = {
-        "X-MS-CLIENT-PRINCIPAL": base64.b64encode(
-            json.dumps(principal).encode()
-        ).decode()
-    }
+    headers = _principal_headers("user_external", "candidate@example.test")
 
-    with TestClient(create_app(easy_auth_settings)) as easy_auth_client:
-        response = easy_auth_client.get("/api/auth/me", headers=headers)
+    with TestClient(create_app(clerk_settings)) as clerk_client:
+        response = clerk_client.get("/api/auth/me", headers=headers)
 
     assert response.status_code == 200
     assert response.json()["email"] == "candidate@example.test"
-    assert response.json()["display_name"] == "Candidate"
+    assert response.json()["display_name"] == "candidate"
 
 
 def test_managed_users_cannot_see_each_others_sessions(tmp_path: Path) -> None:
-    easy_auth_settings = Settings(
-        app_env="test",
-        auth_mode="easy_auth",
+    clerk_settings = _clerk_settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'ownership.db'}",
         auto_create_schema=True,
         web_dist_dir=tmp_path / "missing-dist",
     )
-    with TestClient(create_app(easy_auth_settings)) as easy_auth_client:
+    with TestClient(create_app(clerk_settings)) as clerk_client:
         first_user = _principal_headers("user-a", "a@example.test")
         second_user = _principal_headers("user-b", "b@example.test")
         assert (
-            easy_auth_client.post(
+            clerk_client.post(
                 "/api/interviews",
                 headers=first_user,
                 json={"title": "Private session"},
@@ -2175,25 +2217,107 @@ def test_managed_users_cannot_see_each_others_sessions(tmp_path: Path) -> None:
             == 201
         )
 
-        second_user_sessions = easy_auth_client.get(
-            "/api/interviews", headers=second_user
-        )
+        second_user_sessions = clerk_client.get("/api/interviews", headers=second_user)
         assert second_user_sessions.json() == {"items": []}
 
 
 def test_unauthenticated_managed_request_has_error_id(tmp_path: Path) -> None:
-    easy_auth_settings = Settings(
-        app_env="test",
-        auth_mode="easy_auth",
+    clerk_settings = _clerk_settings(
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'auth.db'}",
         auto_create_schema=True,
         web_dist_dir=tmp_path / "missing-dist",
     )
-    with TestClient(create_app(easy_auth_settings)) as easy_auth_client:
-        response = easy_auth_client.get("/api/auth/me")
+    with TestClient(create_app(clerk_settings)) as clerk_client:
+        response = clerk_client.get("/api/auth/me")
 
     assert response.status_code == 401
     assert response.headers["X-Error-ID"] == response.json()["error"]["id"]
+
+
+def test_clerk_rejects_a_token_signed_by_another_key(tmp_path: Path) -> None:
+    clerk_settings = _clerk_settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'forged.db'}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+    )
+    impostor = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    forged = jwt.encode(
+        _clerk_claims("user-forged", "forged@example.test"),
+        impostor.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode(),
+        algorithm="RS256",
+    )
+
+    with TestClient(create_app(clerk_settings)) as clerk_client:
+        response = clerk_client.get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {forged}"}
+        )
+
+    assert response.status_code == 401
+
+
+def test_clerk_rejects_a_token_from_an_unlisted_authorized_party(
+    tmp_path: Path,
+) -> None:
+    clerk_settings = _clerk_settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'azp.db'}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+    )
+    private_pem, _ = _clerk_keys()
+    claims = _clerk_claims("user-elsewhere", "elsewhere@example.test")
+    claims["azp"] = "https://someone-elses-app.test"
+    token = jwt.encode(claims, private_pem, algorithm="RS256")
+
+    with TestClient(create_app(clerk_settings)) as clerk_client:
+        response = clerk_client.get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {token}"}
+        )
+
+    assert response.status_code == 401
+
+
+def test_clerk_rejects_an_expired_token(tmp_path: Path) -> None:
+    clerk_settings = _clerk_settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'expired.db'}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+    )
+    private_pem, _ = _clerk_keys()
+    claims = _clerk_claims("user-stale", "stale@example.test")
+    claims["exp"] = int(time.time()) - 60
+    token = jwt.encode(claims, private_pem, algorithm="RS256")
+
+    with TestClient(create_app(clerk_settings)) as clerk_client:
+        response = clerk_client.get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {token}"}
+        )
+
+    assert response.status_code == 401
+
+
+def test_clerk_rejects_a_token_without_an_email_claim(tmp_path: Path) -> None:
+    """Clerk's default session token omits email until the claim is added."""
+
+    clerk_settings = _clerk_settings(
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'no-email.db'}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+    )
+    private_pem, _ = _clerk_keys()
+    claims = _clerk_claims("user-anon", "anon@example.test")
+    del claims["email"]
+    token = jwt.encode(claims, private_pem, algorithm="RS256")
+
+    with TestClient(create_app(clerk_settings)) as clerk_client:
+        response = clerk_client.get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {token}"}
+        )
+
+    assert response.status_code == 401
 
 
 def test_validation_errors_have_safe_error_ids(client: TestClient) -> None:
@@ -2207,7 +2331,7 @@ def test_validation_errors_have_safe_error_ids(client: TestClient) -> None:
 
 
 def test_react_build_is_served_from_fastapi(tmp_path: Path) -> None:
-    dist_directory = PROJECT_ROOT / "web" / "dist"
+    dist_directory = REPO_ROOT / "web" / "dist"
     assert (dist_directory / "index.html").is_file(), "Run npm run build first."
     static_settings = Settings(
         app_env="test",
@@ -2466,7 +2590,7 @@ def test_migrations_upgrade_and_roll_back(
     database_path = tmp_path / "migration.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite+aiosqlite:///{database_path}")
     get_settings.cache_clear()
-    configuration = Config(PROJECT_ROOT / "alembic.ini")
+    configuration = Config(SERVER_ROOT / "alembic.ini")
 
     command.upgrade(configuration, "head")
     with sqlite3.connect(database_path) as connection:

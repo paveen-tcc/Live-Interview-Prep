@@ -1,0 +1,37 @@
+# One-time infrastructure definition. Import with:
+#   zcli project project-import zerops-import.yml
+#
+# The database lives in Supabase rather than Zerops, so this project holds a
+# single runtime service. Repeat deploys are driven by zerops.yml through the
+# GitHub Actions workflow, not by re-importing this file.
+project:
+  name: interview-coach
+  tags:
+    - hackathon
+
+services:
+  - hostname: app
+    type: python@3.12
+    enableSubdomainAccess: true
+
+    envVariables:
+      # Non-secret and needed by the Vite build, so it lives here rather than in
+      # envSecrets, which is not exposed to the build container.
+      CLERK_PUBLISHABLE_KEY: pk_test_REPLACE_ME
+
+    # PLACEHOLDERS. Replace these in the Zerops GUI under Service -> Environment
+    # variables, or edit them before importing. Never commit real values.
+    envSecrets:
+      # Supabase -> Project Settings -> Database -> Connection string -> URI,
+      # using the *session* pooler on port 5432. See README for why.
+      DATABASE_URL: postgresql://postgres.REPLACE:REPLACE@aws-0-REGION.pooler.supabase.com:5432/postgres
+      CLERK_SECRET_KEY: sk_test_REPLACE_ME
+      # Optional but recommended: the PEM public key from Clerk -> API keys.
+      # With it set, session verification never makes a network call.
+      CLERK_JWT_KEY: ""
+      AZURE_OPENAI_ENDPOINT: https://REPLACE.services.ai.azure.com
+      AZURE_OPENAI_API_KEY: REPLACE_ME
+      AZURE_OPENAI_TEXT_DEPLOYMENT: gpt-5.6-luna
+      AZURE_OPENAI_REALTIME_DEPLOYMENT: gpt-realtime-2.1
+      AZURE_OPENAI_REALTIME_TRANSCRIPTION_MODEL: gpt-realtime-whisper
+      AZURE_OPENAI_FINAL_TRANSCRIPTION_DEPLOYMENT: gpt-4o-transcribe

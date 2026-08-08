@@ -6,7 +6,6 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -16,6 +15,7 @@ from .config import Settings, get_settings
 from .database import (
     create_database,
     create_schema,
+    ensure_sqlite_parent_directory,
     install_database_network_compatibility,
 )
 from .errors import install_error_handlers
@@ -34,6 +34,49 @@ from .routes import (
 
 logger = logging.getLogger(__name__)
 
+# Clerk serves its browser SDK from the instance's Frontend API origin. Every
+# development instance lives under this wildcard; a production instance on a
+# custom domain is added through CLERK_FRONTEND_API_URL.
+_CLERK_DEV_ORIGIN = "https://*.clerk.accounts.dev"
+_CLERK_IMAGE_ORIGIN = "https://img.clerk.com"
+# Clerk's bot protection renders a Cloudflare Turnstile widget in an iframe.
+_CLERK_TURNSTILE_ORIGIN = "https://challenges.cloudflare.com"
+
+
+def content_security_policy(settings: Settings) -> str:
+    script_src = ["'self'"]
+    connect_src = ["'self'", "https://*.services.ai.azure.com"]
+    img_src = ["'self'", "data:"]
+    frame_src = ["'none'"]
+
+    if settings.auth_mode == "clerk":
+        clerk_origins = [_CLERK_DEV_ORIGIN]
+        explicit = (settings.clerk_frontend_api_url or "").strip().rstrip("/")
+        if explicit and explicit not in clerk_origins:
+            clerk_origins.append(explicit)
+        script_src.extend([*clerk_origins, _CLERK_TURNSTILE_ORIGIN])
+        connect_src.extend(clerk_origins)
+        img_src.append(_CLERK_IMAGE_ORIGIN)
+        frame_src = [_CLERK_TURNSTILE_ORIGIN]
+
+    return "; ".join(
+        [
+            "default-src 'self'",
+            f"script-src {' '.join(script_src)}",
+            "style-src 'self'",
+            "font-src 'self'",
+            f"img-src {' '.join(img_src)}",
+            f"connect-src {' '.join(connect_src)}",
+            "media-src 'self' blob:",
+            "worker-src 'self' blob:",
+            f"frame-src {' '.join(frame_src)}",
+            "object-src 'none'",
+            "base-uri 'self'",
+            "form-action 'self'",
+            "frame-ancestors 'none'",
+        ]
+    )
+
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     resolved_settings = settings or get_settings()
@@ -42,11 +85,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         install_database_network_compatibility(resolved_settings.database_url)
+        ensure_sqlite_parent_directory(resolved_settings.database_url)
         engine, session_factory = create_database(resolved_settings)
         application.state.engine = engine
         application.state.session_factory = session_factory
         if resolved_settings.auto_create_schema:
-            Path("data").mkdir(parents=True, exist_ok=True)
             await create_schema(engine)
         logger.info(
             "application_started",
@@ -72,6 +115,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     application.state.realtime_secret_attempts = {}
     application.state.realtime_secret_cache = {}
     install_error_handlers(application)
+    policy = content_security_policy(resolved_settings)
 
     @application.middleware("http")
     async def request_context(request: Request, call_next):
@@ -101,22 +145,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "camera=(), geolocation=(), microphone=(self)"
         )
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
-        response.headers["Content-Security-Policy"] = "; ".join(
-            [
-                "default-src 'self'",
-                "script-src 'self'",
-                "style-src 'self'",
-                "font-src 'self'",
-                "img-src 'self' data:",
-                "connect-src 'self' https://*.services.ai.azure.com",
-                "media-src 'self' blob:",
-                "worker-src 'self' blob:",
-                "object-src 'none'",
-                "base-uri 'self'",
-                "form-action 'self'",
-                "frame-ancestors 'none'",
-            ]
-        )
+        response.headers["Content-Security-Policy"] = policy
         if resolved_settings.app_env in {"staging", "production"}:
             response.headers["Strict-Transport-Security"] = (
                 "max-age=31536000; includeSubDomains"
