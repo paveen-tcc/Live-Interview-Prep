@@ -24,6 +24,8 @@ const interview: InterviewSession = {
 const capabilities = {
   text_dev_mode_enabled: true,
   realtime_configured: true,
+  live_transcription_configured: true,
+  final_transcription_configured: true,
   typed_answer_max_characters: 20_000,
   supported_durations: [15, 30, 45, 60],
 };

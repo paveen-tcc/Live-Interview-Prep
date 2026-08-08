@@ -50,7 +50,14 @@ class Settings(BaseSettings):
     azure_openai_realtime_deployment: str | None = None
     azure_openai_realtime_voice: str = "marin"
     azure_openai_realtime_transcription_model: str = "gpt-4o-mini-transcribe"
+    azure_openai_final_transcription_deployment: str | None = None
+    azure_openai_transcription_language: str = "en"
+    azure_openai_transcription_delay: Literal[
+        "minimal", "low", "medium", "high", "xhigh"
+    ] = "low"
     azure_openai_realtime_timeout_seconds: float = 20.0
+    azure_openai_final_transcription_timeout_seconds: float = 30.0
+    azure_openai_final_transcription_max_bytes: int = 25_000_000
     resume_llm_timeout_seconds: float = 45.0
     resume_llm_max_input_characters: int = 80_000
     evaluation_llm_timeout_seconds: float = 90.0
@@ -109,6 +116,32 @@ class Settings(BaseSettings):
             (self.azure_openai_endpoint or "").strip()
             and key
             and (self.azure_openai_realtime_deployment or "").strip()
+        )
+
+    @property
+    def live_transcription_configured(self) -> bool:
+        key = (
+            self.azure_openai_api_key.get_secret_value().strip()
+            if self.azure_openai_api_key
+            else ""
+        )
+        return bool(
+            (self.azure_openai_endpoint or "").strip()
+            and key
+            and self.azure_openai_realtime_transcription_model.strip()
+        )
+
+    @property
+    def final_transcription_configured(self) -> bool:
+        key = (
+            self.azure_openai_api_key.get_secret_value().strip()
+            if self.azure_openai_api_key
+            else ""
+        )
+        return bool(
+            (self.azure_openai_endpoint or "").strip()
+            and key
+            and (self.azure_openai_final_transcription_deployment or "").strip()
         )
 
 

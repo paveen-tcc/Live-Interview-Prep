@@ -19,7 +19,24 @@ def _settings() -> Settings:
         azure_openai_api_key="permanent-server-key",
         azure_openai_realtime_deployment="realtime-deployment",
         azure_openai_realtime_voice="marin",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
     )
+
+
+def test_dual_transcription_configuration_uses_explicit_deployment_names() -> None:
+    settings = Settings(
+        _env_file=None,
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
+        azure_openai_final_transcription_deployment="final-stt-deployment",
+        azure_openai_transcription_language="en",
+        azure_openai_transcription_delay="low",
+    )
+
+    assert settings.live_transcription_configured is True
+    assert settings.final_transcription_configured is True
 
 
 @pytest.mark.asyncio
@@ -75,7 +92,11 @@ async def test_voice_secret_configures_vad_and_input_transcription() -> None:
 
     audio = observed["session"]["audio"]
     assert audio["input"]["turn_detection"]["type"] == "server_vad"
-    assert audio["input"]["transcription"]["model"] == "gpt-4o-mini-transcribe"
+    assert audio["input"]["transcription"] == {
+        "model": "live-stt-deployment",
+        "language": "en",
+        "delay": "low",
+    }
 
 
 @pytest.mark.asyncio

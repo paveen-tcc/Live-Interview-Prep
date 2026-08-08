@@ -37,6 +37,8 @@ export type InterviewType = "technical_behavioral" | "technical" | "behavioral";
 export interface Capabilities {
   text_dev_mode_enabled: boolean;
   realtime_configured: boolean;
+  live_transcription_configured: boolean;
+  final_transcription_configured: boolean;
   typed_answer_max_characters: number;
   supported_durations: number[];
 }

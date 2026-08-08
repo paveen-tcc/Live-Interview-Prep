@@ -81,7 +81,9 @@ async def create_realtime_client_secret(
             "input": {
                 "noise_reduction": {"type": "near_field"},
                 "transcription": {
-                    "model": settings.azure_openai_realtime_transcription_model
+                    "model": settings.azure_openai_realtime_transcription_model,
+                    "language": settings.azure_openai_transcription_language,
+                    "delay": settings.azure_openai_transcription_delay,
                 },
                 "turn_detection": {
                     "type": "server_vad",

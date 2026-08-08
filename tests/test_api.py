@@ -577,6 +577,38 @@ def test_text_dev_mode_is_rejected_when_server_flag_is_off(client: TestClient) -
     assert "disabled by the server" in response.json()["error"]["message"]
 
 
+def test_capabilities_expose_only_safe_dual_transcription_configuration(
+    tmp_path: Path,
+) -> None:
+    capability_settings = Settings(
+        _env_file=None,
+        app_env="test",
+        auth_mode="local",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'capabilities.db'}",
+        auto_create_schema=True,
+        web_dist_dir=tmp_path / "missing-dist",
+        azure_openai_endpoint="https://example.services.ai.azure.com",
+        azure_openai_api_key="server-key",
+        azure_openai_realtime_deployment="interviewer-deployment",
+        azure_openai_realtime_transcription_model="live-stt-deployment",
+        azure_openai_final_transcription_deployment="final-stt-deployment",
+    )
+
+    with TestClient(create_app(capability_settings)) as capability_client:
+        response = capability_client.get("/api/capabilities")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["live_transcription_configured"] is True
+    assert body["final_transcription_configured"] is True
+    serialized_body = json.dumps(body)
+    assert "interviewer-deployment" not in serialized_body
+    assert "live-stt-deployment" not in serialized_body
+    assert "final-stt-deployment" not in serialized_body
+    assert "example.services.ai.azure.com" not in serialized_body
+    assert "server-key" not in serialized_body
+
+
 def test_m3_text_realtime_flow_is_private_long_and_idempotent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -613,6 +645,8 @@ def test_m3_text_realtime_flow_is_private_long_and_idempotent(
         assert capabilities == {
             "text_dev_mode_enabled": True,
             "realtime_configured": True,
+            "live_transcription_configured": True,
+            "final_transcription_configured": False,
             "typed_answer_max_characters": 20_000,
             "supported_durations": [15, 30, 45, 60],
         }

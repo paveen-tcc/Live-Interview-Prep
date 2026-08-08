@@ -56,5 +56,7 @@ class InterviewListResponse(BaseModel):
 class CapabilityResponse(BaseModel):
     text_dev_mode_enabled: bool
     realtime_configured: bool
+    live_transcription_configured: bool
+    final_transcription_configured: bool
     typed_answer_max_characters: int
     supported_durations: list[int]
