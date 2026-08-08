@@ -25,6 +25,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     database_url: str = f"sqlite+aiosqlite:///{DEFAULT_DATABASE_PATH.as_posix()}"
     database_connect_timeout_seconds: float = 10.0
+    # Overrides the CA bundle used to verify the database's TLS certificate.
+    # Supabase hosts default to the vendored Supabase root CA; everything else
+    # defaults to certifi.
+    database_ssl_root_cert: Path | None = None
     auto_create_schema: bool = True
     auth_mode: Literal["local", "clerk"] = "local"
     local_auth_subject: str = "local-developer"

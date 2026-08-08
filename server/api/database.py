@@ -28,6 +28,15 @@ _NEON_IPV4_ADAPTER_HOSTS = "_interview_coach_neon_ipv4_hosts"
 # carrying libpq-style query options asyncpg does not understand.
 _MANAGED_POSTGRES_SUFFIXES = (".neon.tech", ".supabase.co", ".supabase.com")
 
+# Supabase serves its database and pooler endpoints from a private CA rather
+# than a publicly trusted one, so certifi's roots reject them. Their public root
+# certificate is vendored here so verify-full works with no extra setup;
+# DATABASE_SSL_ROOT_CERT overrides it.
+_SUPABASE_SUFFIXES = (".supabase.co", ".supabase.com")
+SUPABASE_ROOT_CA = (
+    Path(__file__).resolve().parents[1] / "certs" / ("supabase-prod-ca-2021.crt")
+)
+
 # Supabase's Supavisor pooler runs transaction pooling on 6543 and session
 # pooling on 5432. Transaction pooling multiplexes one server connection across
 # clients, so server-side prepared statements cannot be reused.
@@ -66,8 +75,20 @@ def uses_transaction_pooler(database_url: str) -> bool:
     )
 
 
+def database_ca_bundle(hostname: str | None, ssl_root_cert: object | None) -> str:
+    """Choose the CA bundle that verifies the given database host."""
+
+    if ssl_root_cert:
+        return str(ssl_root_cert)
+    if hostname and hostname.endswith(_SUPABASE_SUFFIXES):
+        return str(SUPABASE_ROOT_CA)
+    return certifi.where()
+
+
 def database_connect_args(
-    database_url: str, timeout_seconds: float = 10.0
+    database_url: str,
+    timeout_seconds: float = 10.0,
+    ssl_root_cert: object | None = None,
 ) -> dict[str, object]:
     normalized = normalized_database_url(database_url)
     if normalized.startswith("sqlite"):
@@ -76,7 +97,9 @@ def database_connect_args(
     if not _is_managed_postgres_host(hostname):
         return {}
     connect_args: dict[str, object] = {
-        "ssl": ssl.create_default_context(cafile=certifi.where()),
+        "ssl": ssl.create_default_context(
+            cafile=database_ca_bundle(hostname, ssl_root_cert)
+        ),
         "timeout": timeout_seconds,
     }
     if uses_transaction_pooler(database_url):
@@ -157,6 +180,7 @@ def create_database(
         connect_args=database_connect_args(
             settings.database_url,
             timeout_seconds=settings.database_connect_timeout_seconds,
+            ssl_root_cert=settings.database_ssl_root_cert,
         ),
         **database_engine_options(settings.database_url),
     )

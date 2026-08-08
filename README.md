@@ -210,19 +210,26 @@ URL, which looks like:
 postgresql://postgres.PROJECTREF:PASSWORD@aws-0-REGION.pooler.supabase.com:5432/postgres
 ```
 
-Three details matter, and the application handles each of them for you:
+Four details matter, and the application handles each of them for you:
 
 - **Use the pooler, not the direct endpoint.** `db.PROJECTREF.supabase.co`
-  resolves over IPv6 only, which many hosts cannot reach. The pooler is
-  IPv4-capable.
+  publishes only an AAAA record — it is IPv6-only, and unreachable from an
+  IPv4-only network. The pooler is IPv4 on every tier. Note the pooler username
+  is `postgres.PROJECTREF`, not plain `postgres`.
 - **Port 5432 is session mode; 6543 is transaction mode.** Session mode is the
   simpler default. If you do use 6543, the app detects the port and turns off
   both asyncpg's and SQLAlchemy's prepared-statement caches, because a
   transaction pooler multiplexes connections and would otherwise fail with
   `DuplicatePreparedStatement`.
+- **TLS uses Supabase's own CA.** Supabase serves a certificate issued by
+  `Supabase Root 2021 CA`, which is not in any public trust store, so verifying
+  against certifi fails with `CERTIFICATE_VERIFY_FAILED`. That root is a public
+  certificate and is vendored at `server/certs/supabase-prod-ca-2021.crt`;
+  Supabase hosts use it automatically. `DATABASE_SSL_ROOT_CERT` overrides it if
+  Supabase ever rotates the root.
 - **`sslmode` and `channel_binding` are stripped** from the URL before it
-  reaches asyncpg, which does not accept them. TLS is still verified against
-  certifi's root store.
+  reaches asyncpg, which does not accept them. Verification still happens —
+  this is `verify-full`, not a downgrade.
 
 Set in `.env`:
 
