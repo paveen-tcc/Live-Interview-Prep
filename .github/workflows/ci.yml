@@ -20,6 +20,16 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.14"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # test_react_build_is_served_from_fastapi asserts that FastAPI serves the
+      # real Vite output, which is how the app is deployed, so web/dist has to
+      # exist before pytest runs.
+      - run: npm ci && npm run build
+        working-directory: web
       - run: python -m pip install -e ".[dev]"
       - run: python -m ruff format --check api domain evals migrations prompts scripts tests
       - run: python -m ruff check api domain evals migrations prompts scripts tests
