@@ -676,7 +676,9 @@ def test_capabilities_expose_only_safe_dual_transcription_configuration(
     assert "server-key" not in serialized_body
 
 
-def test_final_transcription_route_defers_multipart_to_bounded_request_parser() -> None:
+def test_final_transcription_openapi_documents_bounded_raw_multipart(
+    client: TestClient,
+) -> None:
     signature = inspect.signature(realtime_routes.finalize_candidate_transcription)
 
     assert "file" not in signature.parameters
@@ -684,6 +686,20 @@ def test_final_transcription_route_defers_multipart_to_bounded_request_parser() 
         "UploadFile" not in str(parameter.annotation)
         for parameter in signature.parameters.values()
     )
+    response = client.get("/api/openapi.json")
+    assert response.status_code == 200
+    operation = response.json()["paths"][
+        "/api/interviews/{interview_id}/turns/{client_turn_id}:transcribe"
+    ]["post"]
+    request_body = operation["requestBody"]
+    assert request_body["required"] is True
+    schema = request_body["content"]["multipart/form-data"]["schema"]
+    assert schema["required"] == ["file"]
+    assert schema["properties"] == {
+        "file": {"type": "string", "format": "binary"},
+        "started_at": {"type": "string", "format": "date-time"},
+        "ended_at": {"type": "string", "format": "date-time"},
+    }
 
 
 @pytest.mark.parametrize("client_turn_id", ["ab", "bad.id", "x" * 97])

@@ -630,6 +630,30 @@ async def _upsert_interview_turns_once(
 @router.post(
     "/{interview_id}/turns/{client_turn_id}:transcribe",
     response_model=InterviewTurnResponse,
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {
+                "multipart/form-data": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["file"],
+                        "properties": {
+                            "file": {"type": "string", "format": "binary"},
+                            "started_at": {
+                                "type": "string",
+                                "format": "date-time",
+                            },
+                            "ended_at": {
+                                "type": "string",
+                                "format": "date-time",
+                            },
+                        },
+                    }
+                }
+            },
+        }
+    },
 )
 async def finalize_candidate_transcription(
     interview_id: str,
