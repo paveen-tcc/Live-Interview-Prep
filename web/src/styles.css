@@ -1697,6 +1697,15 @@ h3 {
   margin-bottom: var(--space-0);
 }
 
+.transcription-notice {
+  padding: var(--space-2) var(--space-3);
+  border: var(--border-width) solid var(--color-info);
+  border-radius: var(--radius-md);
+  color: var(--color-text-muted);
+  background: var(--color-surface);
+  font-size: var(--text-xs);
+}
+
 .interview-layout {
   display: grid;
   grid-template-columns: minmax(var(--space-0), 1.45fr) minmax(

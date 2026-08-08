@@ -20,15 +20,25 @@ import {
   typedAnswerError,
   type RealtimeEvent,
 } from "./realtime";
+import {
+  COORDINATOR_FATAL_MESSAGE,
+  TranscriptionCoordinatorError,
+  TurnTranscriptionCoordinator,
+} from "./transcription";
 import type {
   Capabilities,
   InputMode,
   InterviewRuntime,
   InterviewSession,
+  InterviewTurn,
   InterviewTurnInput,
   InterviewType,
   SpeechSegmentInput,
 } from "./types";
+import {
+  BufferedUtteranceRecorder,
+  selectRecorderMimeType,
+} from "./voiceCapture";
 
 interface PracticePageProps {
   interview: InterviewSession;
@@ -44,6 +54,31 @@ interface PendingAnswer {
   client_turn_id: string;
   transcript: string;
   started_at: string;
+}
+
+const RECORDER_UNSUPPORTED_MESSAGE =
+  "This browser cannot record answer audio for final transcription. Use a recent Chrome, Edge, or Safari.";
+
+function missingTranscriptionDeployments(
+  capabilities: Capabilities | null,
+): string | null {
+  if (!capabilities) return null;
+  const missing: string[] = [];
+  if (!capabilities.live_transcription_configured) missing.push("live");
+  if (!capabilities.final_transcription_configured) missing.push("final");
+  if (missing.length === 0) return null;
+  const names = missing
+    .map((lane) => `${lane} transcription deployment`)
+    .join(" and the ");
+  return `The ${names} is not configured. Voice interviews need both.`;
+}
+
+function isAcceptedLiveFallback(turn: InterviewTurn): boolean {
+  return (
+    turn.speaker === "user" &&
+    turn.transcription_source === "realtime_live" &&
+    Boolean(turn.transcription_finalized_at)
+  );
 }
 
 function sessionValue<T>(key: string, fallback: T): T {
@@ -93,6 +128,8 @@ export function PracticePage({
   const [answerError, setAnswerError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [liveAssistant, setLiveAssistant] = useState("");
+  const [finalizing, setFinalizing] = useState(false);
+  const [liveFallbackUsed, setLiveFallbackUsed] = useState(false);
   const [remainingSeconds, setRemainingSeconds] = useState(duration * 60);
   const audioRef = useRef<HTMLAudioElement>(null);
   const transcriptStreamRef = useRef<HTMLDivElement>(null);
@@ -112,6 +149,10 @@ export function PracticePage({
   const connectionEpochRef = useRef(Date.now());
   const speechStartsRef = useRef(new Map<string, number>());
   const speechSegmentsRef = useRef(new Map<string, SpeechSegmentInput[]>());
+  const recorderRef = useRef<BufferedUtteranceRecorder | null>(null);
+  const recorderStreamRef = useRef<MediaStream | null>(null);
+  const coordinatorRef = useRef<TurnTranscriptionCoordinator | null>(null);
+  const retainedAssistantRef = useRef<InterviewTurnInput[]>([]);
 
   useEffect(() => {
     let active = true;
@@ -182,6 +223,8 @@ export function PracticePage({
 
   useEffect(
     () => () => {
+      recorderRef.current?.stop();
+      coordinatorRef.current?.dispose();
       transportRef.current?.close(true);
       for (const track of mediaRef.current?.getTracks() ?? []) track.stop();
     },
@@ -190,9 +233,14 @@ export function PracticePage({
 
   const maximumCharacters = capabilities?.typed_answer_max_characters ?? 20_000;
   const characterCount = countUnicodeCharacters(draft);
+  const transcriptionWarning =
+    inputMode === "voice"
+      ? missingTranscriptionDeployments(capabilities)
+      : null;
   const canStart =
     capabilities?.realtime_configured &&
     headphonesReady &&
+    !transcriptionWarning &&
     (inputMode === "text_dev" || (microphoneConsent && microphoneReady));
   const transcript = runtime?.turns ?? [];
 
@@ -221,6 +269,11 @@ export function PracticePage({
 
   async function checkMicrophone() {
     setError(null);
+    if (!selectRecorderMimeType()) {
+      setMicrophoneReady(false);
+      setError(RECORDER_UNSUPPORTED_MESSAGE);
+      return;
+    }
     try {
       mediaRef.current = await prepareInputMedia("voice", mediaRef.current);
       const [track] = mediaRef.current?.getAudioTracks() ?? [];
@@ -266,10 +319,132 @@ export function PracticePage({
     setInputMode(nextMode);
   }
 
+  function applyRuntime(nextRuntime: InterviewRuntime) {
+    setRuntime(nextRuntime);
+    if (nextRuntime.turns.some(isAcceptedLiveFallback)) {
+      setLiveFallbackUsed(true);
+    }
+    void flushDeliveryObservations(nextRuntime);
+  }
+
+  async function flushDeliveryObservations(nextRuntime: InterviewRuntime) {
+    if (inputMode !== "voice" || !deliveryConsent) return;
+    const items: Array<{
+      turn_id: string;
+      speech_segments: SpeechSegmentInput[];
+    }> = [];
+    for (const [clientTurnId, segments] of speechSegmentsRef.current) {
+      if (!segments.length) continue;
+      const savedTurn = nextRuntime.turns.find(
+        (turn) => turn.client_turn_id === clientTurnId,
+      );
+      if (!savedTurn) continue;
+      items.push({ turn_id: savedTurn.id, speech_segments: segments });
+      speechSegmentsRef.current.delete(clientTurnId);
+    }
+    if (!items.length) return;
+    try {
+      await api.saveDeliveryObservations(interview.id, items);
+    } catch {
+      setError(
+        "The transcript was saved, but delivery observations need a retry.",
+      );
+    }
+  }
+
   async function persistTurn(item: InterviewTurnInput) {
     const nextRuntime = await api.saveTurns(interview.id, [item]);
-    setRuntime(nextRuntime);
+    applyRuntime(nextRuntime);
     return nextRuntime;
+  }
+
+  function ensureTranscriptionUnits(stream: MediaStream) {
+    if (!coordinatorRef.current) {
+      coordinatorRef.current = new TurnTranscriptionCoordinator(
+        interview.id,
+        {
+          saveTurns: (interviewId, items) => api.saveTurns(interviewId, items),
+          transcribeTurn: (interviewId, clientTurnId, utterance) =>
+            api.transcribeTurn(interviewId, clientTurnId, utterance),
+          acceptLiveTranscript: (interviewId, clientTurnId) =>
+            api.acceptLiveTranscript(interviewId, clientTurnId),
+          recordTranscriptionEvent: (interviewId, kind) =>
+            api.recordTranscriptionEvent(interviewId, kind),
+        },
+        {
+          onRuntime: applyRuntime,
+          onFatal: () => pauseForTranscription(),
+          onRecovered: () => setError(null),
+        },
+      );
+    }
+    if (recorderRef.current && recorderStreamRef.current === stream) return;
+    recorderRef.current?.stop();
+    const recorder = new BufferedUtteranceRecorder(stream, {
+      onUtterance: (utterance) => coordinatorRef.current?.audioReady(utterance),
+      onError: (message) =>
+        pauseForTranscription(`${message} Reconnect to retry this answer.`),
+    });
+    recorderRef.current = recorder;
+    recorderStreamRef.current = stream;
+    recorder.start();
+  }
+
+  function pauseForTranscription(reason?: string) {
+    transportRef.current?.setMicrophoneEnabled(false);
+    transportRef.current?.close(false);
+    setFinalizing(false);
+    setConnection("reconnecting");
+    setError(reason ?? COORDINATOR_FATAL_MESSAGE);
+    void api
+      .connectionState(interview.id, "reconnecting")
+      .catch(() => undefined);
+  }
+
+  async function flushRetainedAssistant() {
+    const retained = retainedAssistantRef.current;
+    if (!retained.length) return;
+    retainedAssistantRef.current = [];
+    try {
+      for (const item of retained) await persistTurn(item);
+    } catch {
+      retainedAssistantRef.current = [
+        ...retained,
+        ...retainedAssistantRef.current,
+      ];
+      setError("The interviewer transcript was not saved. Reconnect to retry.");
+    }
+  }
+
+  function persistAssistantTurn(item: InterviewTurnInput) {
+    const coordinator = coordinatorRef.current;
+    if (!coordinator) {
+      void persistTurn(item).catch(() => {
+        setError("The interviewer transcript needs a retry.");
+      });
+      return;
+    }
+    void (async () => {
+      try {
+        await coordinator.awaitIdle();
+      } catch {
+        retainedAssistantRef.current.push(item);
+        return;
+      }
+      await persistTurn(item);
+    })().catch(() => {
+      setError("The interviewer transcript needs a retry.");
+    });
+  }
+
+  function releaseMedia() {
+    recorderRef.current?.stop();
+    recorderRef.current = null;
+    recorderStreamRef.current = null;
+    coordinatorRef.current?.dispose();
+    coordinatorRef.current = null;
+    for (const track of mediaRef.current?.getTracks() ?? []) track.stop();
+    mediaRef.current = null;
   }
 
   function handleRealtimeEvent(event: RealtimeEvent) {
@@ -278,21 +453,21 @@ export function PracticePage({
       setResponseActive(false);
       return;
     }
-    if (
-      event.type === "input_audio_buffer.speech_started" &&
-      event.item_id &&
-      typeof event.audio_start_ms === "number"
-    ) {
-      speechStartsRef.current.set(event.item_id, event.audio_start_ms);
+    if (event.type === "input_audio_buffer.speech_started" && event.item_id) {
+      recorderRef.current?.speechStarted(event.item_id);
+      if (typeof event.audio_start_ms === "number") {
+        speechStartsRef.current.set(event.item_id, event.audio_start_ms);
+      }
       return;
     }
-    if (
-      event.type === "input_audio_buffer.speech_stopped" &&
-      event.item_id &&
-      typeof event.audio_end_ms === "number"
-    ) {
+    if (event.type === "input_audio_buffer.speech_stopped" && event.item_id) {
+      recorderRef.current?.speechStopped(event.item_id);
       const startedAt = speechStartsRef.current.get(event.item_id);
-      if (startedAt !== undefined && event.audio_end_ms > startedAt) {
+      if (
+        typeof event.audio_end_ms === "number" &&
+        startedAt !== undefined &&
+        event.audio_end_ms > startedAt
+      ) {
         const segments = speechSegmentsRef.current.get(event.item_id) ?? [];
         segments.push(
           absoluteSpeechSegment(
@@ -304,6 +479,13 @@ export function PracticePage({
         speechSegmentsRef.current.set(event.item_id, segments);
       }
       speechStartsRef.current.delete(event.item_id);
+      return;
+    }
+    if (
+      event.type === "conversation.item.input_audio_transcription.failed" &&
+      event.item_id
+    ) {
+      coordinatorRef.current?.liveFailed(event.item_id);
       return;
     }
     if (
@@ -335,33 +517,18 @@ export function PracticePage({
       event.transcript?.trim()
     ) {
       const clientTurnId = event.item_id ?? randomTurnId("voice");
-      void (async () => {
-        const nextRuntime = await persistTurn({
-          client_turn_id: clientTurnId,
-          speaker: "user",
-          transcript: event.transcript ?? "",
-          delivery_status: "acknowledged",
-        });
-        const savedTurn = nextRuntime.turns.find(
-          (turn) => turn.client_turn_id === clientTurnId,
-        );
-        const speechSegments =
-          speechSegmentsRef.current.get(clientTurnId) ?? [];
-        if (
-          inputMode === "voice" &&
-          deliveryConsent &&
-          savedTurn &&
-          speechSegments.length
-        ) {
-          await api.saveDeliveryObservations(interview.id, [
-            { turn_id: savedTurn.id, speech_segments: speechSegments },
-          ]);
-          speechSegmentsRef.current.delete(clientTurnId);
-        }
-      })().catch(() => {
-        setError(
-          "The transcript was saved, but delivery observations need a retry.",
-        );
+      const coordinator = coordinatorRef.current;
+      if (coordinator) {
+        coordinator.liveCompleted(clientTurnId, event.transcript);
+        return;
+      }
+      void persistTurn({
+        client_turn_id: clientTurnId,
+        speaker: "user",
+        transcript: event.transcript ?? "",
+        delivery_status: "acknowledged",
+      }).catch(() => {
+        setError("The transcript was not saved. Reconnect to retry.");
       });
       return;
     }
@@ -378,7 +545,7 @@ export function PracticePage({
       assistantTranscriptRef.current = "";
       setLiveAssistant("");
       if (text.trim()) {
-        void persistTurn({
+        persistAssistantTurn({
           client_turn_id: event.item_id ?? randomTurnId("assistant"),
           speaker: "assistant",
           transcript: text,
@@ -413,6 +580,15 @@ export function PracticePage({
         inputMode === "voice" && deliveryConsent,
       );
       mediaRef.current = await prepareInputMedia(inputMode, mediaRef.current);
+      if (inputMode === "voice") {
+        if (!mediaRef.current) {
+          throw new Error("Microphone preflight is incomplete.");
+        }
+        if (!selectRecorderMimeType()) {
+          throw new Error(RECORDER_UNSUPPORTED_MESSAGE);
+        }
+        ensureTranscriptionUnits(mediaRef.current);
+      }
       if (runtime?.started_at && runtime.status === "IN_PROGRESS") {
         await api.connectionState(interview.id, "reconnecting");
       }
@@ -436,11 +612,18 @@ export function PracticePage({
         onReady: () => {
           void (async () => {
             const shouldStartInterview = initialConnectionRef.current;
+            const coordinator = coordinatorRef.current;
+            if (coordinator) {
+              transport.setMicrophoneEnabled(false);
+              await coordinator.retryRetained();
+              await flushRetainedAssistant();
+              transport.setMicrophoneEnabled(true);
+            }
             const connectedRuntime = await api.connectionState(
               interview.id,
               "connected",
             );
-            setRuntime(connectedRuntime);
+            applyRuntime(connectedRuntime);
             setConnection("connected");
             const pending = pendingRef.current;
             const acknowledged = pending
@@ -463,6 +646,10 @@ export function PracticePage({
             }
             initialConnectionRef.current = false;
           })().catch((caught: unknown) => {
+            if (caught instanceof TranscriptionCoordinatorError) {
+              pauseForTranscription();
+              return;
+            }
             setError(
               caught instanceof Error
                 ? caught.message
@@ -523,14 +710,27 @@ export function PracticePage({
   }
 
   async function stopInterview() {
+    if (finalizing) return;
     stoppedRef.current = true;
-    transportRef.current?.close(true);
-    for (const track of mediaRef.current?.getTracks() ?? []) track.stop();
-    mediaRef.current = null;
+    transportRef.current?.setMicrophoneEnabled(false);
+    setFinalizing(true);
+    await recorderRef.current?.finish();
+    transportRef.current?.close(false);
+    const coordinator = coordinatorRef.current;
+    if (coordinator) {
+      try {
+        await coordinator.awaitIdle();
+      } catch {
+        pauseForTranscription();
+        return;
+      }
+      await flushRetainedAssistant();
+    }
     setConnection("idle");
     try {
       await api.completeInterview(interview.id);
       onInterviewUpdated(await api.interview(interview.id));
+      releaseMedia();
       setPhase("ended");
     } catch (caught) {
       setError(
@@ -538,18 +738,21 @@ export function PracticePage({
           ? caught.message
           : "The interview did not stop.",
       );
+    } finally {
+      setFinalizing(false);
     }
   }
 
   stopInterviewRef.current = stopInterview;
 
   const statusLabel = useMemo(() => {
+    if (finalizing) return "Finalizing your transcript";
     if (connection === "connected" && responseActive) return "AI speaking";
     if (connection === "connected") return "Listening";
     if (connection === "reconnecting") return "Connection interrupted";
     if (connection === "failed") return "Reconnect required";
     return connection === "connecting" ? "Connecting" : "Ready";
-  }, [connection, responseActive]);
+  }, [connection, finalizing, responseActive]);
 
   return (
     <main className="canvas practice-canvas">
@@ -756,6 +959,9 @@ export function PracticePage({
                   Realtime deployment is not configured.
                 </p>
               ) : null}
+              {transcriptionWarning ? (
+                <p className="preflight-warning">{transcriptionWarning}</p>
+              ) : null}
               <button
                 className="btn btn--primary preflight-start"
                 type="button"
@@ -792,6 +998,7 @@ export function PracticePage({
               <button
                 className="btn btn--sm stop-button"
                 type="button"
+                disabled={finalizing}
                 onClick={stopInterview}
               >
                 <StopIcon size={16} /> Stop
@@ -810,6 +1017,12 @@ export function PracticePage({
                 Play audio
               </button>
             </div>
+          ) : null}
+          {liveFallbackUsed ? (
+            <p className="transcription-notice" role="status">
+              Using live transcript for at least one answer. The interview is
+              still connected.
+            </p>
           ) : null}
           <div className="interview-layout">
             <section
